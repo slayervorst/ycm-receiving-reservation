@@ -22,7 +22,7 @@
 
 /* ============================================================
  * 設定：請把下面這行換成你部署 Apps Script 後拿到的 Web App 網址
- * （見附上的《設定指南.md》）
+ * （見附上的《SETUP-GUIDE.md》）
  * ============================================================ */
 var API_URL = 'https://script.google.com/macros/s/AKfycbwWPL8YD_MwzE1DJZGz6TfeQH3RJkrMlQ2No7TRthQqcCY1l6ljxPdmOZ4p7Fbep716/exec';
 
@@ -79,7 +79,7 @@ function loadXLSX() {
 function apiConfigured() { return API_URL && API_URL.indexOf('PASTE_YOUR') === -1 }
 
 function api(action, payload) {
-  if (!apiConfigured()) return Promise.reject(new Error('尚未設定後端網址，請參考《設定指南.md》完成部署'))
+  if (!apiConfigured()) return Promise.reject(new Error('尚未設定後端網址，請參考《SETUP-GUIDE.md》完成部署'))
   return fetch(API_URL, { method: 'POST', body: JSON.stringify({ action: action, payload: payload || {} }) })
     .then(function (res) { return res.json() })
     .then(function (json) {
@@ -129,6 +129,22 @@ function slotMatchesScope(slot, scope) {
   if (scope === 'pm') return slot.indexOf('下午') >= 0
   return false
 }
+function ruleActiveOnDate(r, date) { return r.type === 'global' ? true : !(date < r.startDate || date > r.endDate) }
+function ruleCoversAll(r) { return !r.categories || r.categories.length === 0 || r.categories.indexOf('all') >= 0 }
+function bookingHitsRule(locs, r) { return ruleCoversAll(r) || locs.some(function (l) { return r.categories.indexOf(l) >= 0 }) }
+// slotCounts[slot] = 該時段每筆有效預約的地點清單陣列（相容舊格式數字：視為地點不明、全部計入）
+function slotBookingsList(slotCounts, slot) {
+  var v = slotCounts && slotCounts[slot]
+  if (Array.isArray(v)) return v
+  if (typeof v === 'number') { var out = []; for (var i = 0; i < v; i++) out.push(null); return out }
+  return []
+}
+function countBookings(slotBookings, editingLocs, pred) {
+  var n = 0
+  slotBookings.forEach(function (locs) { if (locs === null || pred(locs)) n++ })
+  if (editingLocs && pred(editingLocs)) n = Math.max(0, n - 1)
+  return n
+}
 function computeAvailability(opts) {
   var date = opts.date, locations = opts.locations || [], rules = opts.rules || [], slotCounts = opts.slotCounts || {}
   var editingSlot = opts.editingSlot, includeCutoff = !!opts.includeCutoff
@@ -145,9 +161,10 @@ function computeAvailability(opts) {
     TIME_SLOTS.forEach(function (slot) { availability[slot].available = false; availability[slot].reason = '週末' })
   }
 
+  // 規則是否套用到「目前勾選的地點」：含「全部類別」一律套用，否則要與勾選地點有重疊（全域預設 / 特定條件皆同）
   var applicable = rules.filter(function (r) {
-    if (r.type !== 'global' && (date < r.startDate || date > r.endDate)) return false
-    return r.type === 'global' || r.categories.indexOf('all') >= 0 || (locations.length > 0 && r.categories.some(function (c) { return locations.indexOf(c) >= 0 }))
+    if (!ruleActiveOnDate(r, date)) return false
+    return ruleCoversAll(r) || (locations.length > 0 && r.categories.some(function (c) { return locations.indexOf(c) >= 0 }))
   })
 
   applicable.filter(function (r) { return r.mode === 'block' }).forEach(function (rule) {
@@ -174,20 +191,36 @@ function computeAvailability(opts) {
   }
 
   if (!dayBlocked) {
+    var limitRules = applicable.filter(function (r) { return r.mode === 'limit' })
     TIME_SLOTS.forEach(function (slot) {
       if (!availability[slot].available) return
-      var capacity = Infinity
-      var hasLimitRule = false
-      applicable.filter(function (r) { return r.mode === 'limit' }).forEach(function (r) {
-        if (r.type === 'global' || slotMatchesScope(slot, r.timeScope)) { hasLimitRule = true; capacity = Math.min(capacity, parseInt(r.limit, 10)) }
+      var slotBookings = slotBookingsList(slotCounts, slot)
+      var editing = editingSlot && editingSlot.date === date && editingSlot.time === slot
+      var editingLocs = editing ? (editingSlot.locations || []) : null
+      var pools = []
+      // (1) 每條限額規則各自一個名額池：已用 = 該時段「有勾到該規則任一適用類別」的預約筆數（同一筆只算一次）
+      limitRules.forEach(function (r) {
+        if (r.type !== 'global' && !slotMatchesScope(slot, r.timeScope)) return
+        var used = countBookings(slotBookings, editingLocs, function (locs) { return bookingHitsRule(locs, r) })
+        pools.push({ capacity: parseInt(r.limit, 10), used: used, label: ruleCoversAll(r) ? '' : r.categories.join('/') })
       })
-      var effectiveCapacity = hasLimitRule ? capacity : DEFAULT_SLOT_CAPACITY
-      var count = (slotCounts && slotCounts[slot]) || 0
-      if (editingSlot && editingSlot.date === date && editingSlot.time === slot) count = Math.max(0, count - 1)
-      var remaining = Math.max(0, effectiveCapacity - count)
+      // (2) 沒被任何限額規則涵蓋的地點，各自用系統預設容量、各自獨立計算
+      locations.forEach(function (loc) {
+        var covered = limitRules.some(function (r) {
+          return (r.type === 'global' || slotMatchesScope(slot, r.timeScope)) && (ruleCoversAll(r) || r.categories.indexOf(loc) >= 0)
+        })
+        if (covered) return
+        var used = countBookings(slotBookings, editingLocs, function (locs) { return locs.indexOf(loc) >= 0 })
+        pools.push({ capacity: DEFAULT_SLOT_CAPACITY, used: used, label: loc })
+      })
+      if (pools.length === 0) pools.push({ capacity: DEFAULT_SLOT_CAPACITY, used: 0, label: '' })
+      // 該時段剩餘 = 所有相關名額池中最少的那一個
+      var tightest = pools[0]
+      pools.forEach(function (p) { if (p.capacity - p.used < tightest.capacity - tightest.used) tightest = p })
+      var remaining = Math.max(0, tightest.capacity - tightest.used)
       availability[slot].remaining = remaining
-      availability[slot].capacity = effectiveCapacity
-      if (remaining <= 0) { availability[slot].available = false; availability[slot].reason = '已額滿' }
+      availability[slot].capacity = tightest.capacity
+      if (remaining <= 0) { availability[slot].available = false; availability[slot].reason = '已額滿' + (tightest.label && locations.length > 1 ? '（' + tightest.label + '）' : '') }
     })
   }
 
@@ -243,11 +276,13 @@ var mb = {
     mb.render()
   },
 
-  editAvailability: function () {
+  editAvailability: function (booking) {
     if (!mb.state.editingId) return { availability: {}, dayBlocked: false }
+    // editingSlot 傳「這筆預約原本的日期/時段/地點」，讓它自己原本佔的名額不會卡到自己
+    var orig = booking || mb.state.results.filter(function (b) { return b.id === mb.state.editingId })[0] || {}
     return computeAvailability({
       date: mb.state.editForm.date, locations: mb.state.editForm.locations, rules: GLOBAL.rules, slotCounts: mb.state.slotCounts,
-      editingSlot: { date: mb.state.editForm.date, time: mb.state.editForm.time }, includeCutoff: true,
+      editingSlot: { date: orig.date, time: orig.time, locations: orig.locations || [] }, includeCutoff: true,
     })
   },
 
@@ -301,7 +336,7 @@ var mb = {
   renderEditCard: function (booking) {
     var s = mb.state
     var ef = s.editForm
-    var result = mb.editAvailability()
+    var result = mb.editAvailability(booking)
     var isParcel = ef.locations.indexOf(PARCEL_LOCATION) >= 0
     return '' +
       '<div class="bg-white border-2 border-amber-400 rounded-xl p-5 shadow-lg relative animate-fade-in">' +
@@ -398,7 +433,7 @@ var mb = {
       var bookingId = target.getAttribute('data-id')
       var booking2 = s.results.filter(function (b) { return b.id === bookingId })[0]
       if (!booking2) return
-      var result = mb.editAvailability()
+      var result = mb.editAvailability(booking2)
       if (result.dayBlocked) { alert('所選日期暫停預約或已過時限'); return }
       var slot = result.availability[s.editForm.time]
       if (!slot || !slot.available) { alert('所選時段不可用'); return }
@@ -508,7 +543,7 @@ function renderShell() {
   if (!apiConfigured()) {
     qs('#setup-banner').innerHTML = '' +
       '<div class="fixed inset-x-0 bottom-0 z-[60] bg-amber-500 text-white text-sm font-bold text-center py-3 px-4 shadow-2xl">' +
-      '⚠️ 尚未設定後端網址：請打開 index.html，把最上方 API_URL 換成你部署 Apps Script 後拿到的 Web App 網址（詳見《設定指南.md》）</div>'
+      '⚠️ 尚未設定後端網址：請打開 index.html，把最上方 API_URL 換成你部署 Apps Script 後拿到的 Web App 網址（詳見《SETUP-GUIDE.md》）</div>'
   }
 
   renderPage()
