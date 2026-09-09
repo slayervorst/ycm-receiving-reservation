@@ -12,6 +12,15 @@
   .animate-slide-in { animation: slide-in .25s ease-out; }
   .animate-fade-in { animation: fade-in .3s ease-out; }
   body { margin: 0; }
+  /* 列印「中午新增預約清單」時只印清單本身 */
+  @media print {
+    body * { visibility: hidden !important; }
+    #noon-print, #noon-print * { visibility: visible !important; }
+    #noon-print { position: absolute; left: 0; top: 0; width: 100%; padding: 16px; background: #fff; }
+    #noon-print table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    #noon-print th, #noon-print td { border: 1px solid #999; padding: 6px 8px; text-align: left; }
+    .no-print { display: none !important; }
+  }
 </style>
 </head>
 <body class="min-h-screen bg-slate-100 font-sans text-gray-900">
@@ -925,6 +934,28 @@ var ap = {
     search: '', bookings: [], loadingList: false, exporting: false, updatingId: null,
     showPasswordModal: false, newPassword: '', confirmPassword: '', changingPassword: false,
     showHistory: false, highlightId: null, showCancelled: false, firstLoad: true,
+    showNoonModal: false, noonLoading: false, noonBookings: [], noonShowAll: false, noonExporting: false,
+  },
+
+  // 早上出單時間（07:45）之後才新增/異動、且預約「今天下午」時段的預約，就是中午出單時需要補列的廠商
+  NOON_CUTOFF: { h: 7, m: 45 },
+  noonCutoffDate: function () { var d = new Date(); d.setHours(ap.NOON_CUTOFF.h, ap.NOON_CUTOFF.m, 0, 0); return d },
+  classifyNoon: function (b) {
+    // 回傳 'new'（07:45 後新增）、'moved'（07:45 前就存在，但 07:45 後被改到今天下午）或 ''（早上出單時就已經在名單上）
+    var cutoff = ap.noonCutoffDate()
+    var created = b.createdAt ? new Date(b.createdAt) : null
+    var updated = b.updatedAt ? new Date(b.updatedAt) : null
+    if (created && !isNaN(created) && created >= cutoff) return 'new'
+    if (updated && !isNaN(updated) && updated >= cutoff) return 'moved'
+    return ''
+  },
+  noonList: function () {
+    var today = todayStr()
+    return ap.state.noonBookings
+      .filter(function (b) { return b.date === today && b.status === 'active' && String(b.time).indexOf('下午') >= 0 })
+      .map(function (b) { return Object.assign({}, b, { noonKind: ap.classifyNoon(b) }) })
+      .filter(function (b) { return ap.state.noonShowAll || b.noonKind })
+      .sort(function (a, b) { return a.time < b.time ? -1 : a.time > b.time ? 1 : (a.createdAt || '') < (b.createdAt || '') ? -1 : 1 })
   },
 
   mount: function (host) {
@@ -1016,6 +1047,7 @@ var ap = {
       '</div></div>' +
 
       (s.showPasswordModal ? ap.renderPasswordModal() : '') +
+      (s.showNoonModal ? ap.renderNoonModal() : '') +
 
       '<div id="admin-subview"></div>' +
       '</div>'
@@ -1035,6 +1067,105 @@ var ap = {
       '<button data-action="close-password-modal" class="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-bold">取消</button>' +
       '<button data-action="submit-password" ' + (s.changingPassword ? 'disabled' : '') + ' class="px-4 py-2 bg-slate-900 text-white rounded-lg text-sm font-bold hover:bg-black transition">' + (s.changingPassword ? '處理中...' : '確認修改') + '</button>' +
       '</div></div></div>'
+  },
+
+  renderNoonModal: function () {
+    var s = ap.state
+    var list = ap.noonList()
+    var cutoffLabel = String(ap.NOON_CUTOFF.h).padStart(2, '0') + ':' + String(ap.NOON_CUTOFF.m).padStart(2, '0')
+    var now = new Date()
+    var stamp = displayDate(todayStr()) + ' ' + String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0')
+    var kindBadge = function (k) {
+      if (k === 'new') return '<span class="text-[10px] font-bold text-green-700 bg-green-100 px-2 py-0.5 rounded border border-green-200">新增</span>'
+      if (k === 'moved') return '<span class="text-[10px] font-bold text-amber-700 bg-amber-100 px-2 py-0.5 rounded border border-amber-200">改期/改時段</span>'
+      return '<span class="text-[10px] font-bold text-gray-500 bg-gray-100 px-2 py-0.5 rounded border border-gray-200">早上已出單</span>'
+    }
+    var fmtTime = function (iso) { if (!iso) return ''; var d = new Date(iso); return isNaN(d) ? '' : String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') }
+
+    return '' +
+      '<div class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" data-action="close-noon-backdrop">' +
+      '<div class="bg-white rounded-2xl w-full max-w-4xl shadow-2xl animate-fade-in max-h-[90vh] flex flex-col">' +
+      '<div class="flex justify-between items-start p-6 border-b border-gray-100 no-print">' +
+      '<div><h3 class="text-lg font-bold text-gray-800 flex items-center gap-2"><i data-lucide="sun" class="h-5 w-5 text-amber-500"></i> 中午新增預約（今日下午時段）</h3>' +
+      '<p class="text-xs text-gray-500 mt-1">列出今天 <b>' + cutoffLabel + '</b> 早上出單之後才新增、或被改到「今天下午」時段的有效預約，方便中午出單時補列名單。</p></div>' +
+      '<button data-action="close-noon" class="p-2 text-gray-400 hover:bg-gray-100 rounded-lg"><i data-lucide="x" class="h-5 w-5"></i></button></div>' +
+
+      '<div class="flex flex-wrap items-center gap-3 px-6 py-3 bg-slate-50 border-b border-gray-100 no-print">' +
+      '<label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer"><input type="checkbox" data-onchange="noon-show-all" ' + (s.noonShowAll ? 'checked' : '') + ' class="w-4 h-4" /> 顯示今天下午「全部」預約（含早上已出單的）</label>' +
+      '<div class="ml-auto flex gap-2">' +
+      '<button data-action="noon-refresh" ' + (s.noonLoading ? 'disabled' : '') + ' class="flex items-center gap-1 px-3 py-2 text-sm font-bold text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50">' + (s.noonLoading ? '重新整理中...' : '<i data-lucide="refresh-cw" class="h-4 w-4"></i> 重新整理') + '</button>' +
+      '<button data-action="noon-print" ' + (list.length === 0 ? 'disabled' : '') + ' class="flex items-center gap-1 px-3 py-2 text-sm font-bold text-white bg-slate-800 rounded-lg hover:bg-black disabled:opacity-40"><i data-lucide="printer" class="h-4 w-4"></i> 列印</button>' +
+      '<button data-action="noon-export" ' + (list.length === 0 || s.noonExporting ? 'disabled' : '') + ' class="flex items-center gap-1 px-3 py-2 text-sm font-bold text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-40">' + (s.noonExporting ? '匯出中...' : '<i data-lucide="download" class="h-4 w-4"></i> 匯出 Excel') + '</button>' +
+      '</div></div>' +
+
+      '<div id="noon-print" class="p-6 overflow-y-auto">' +
+      '<div class="mb-3"><div class="text-base font-bold text-gray-800">' + (s.noonShowAll ? '今日下午全部預約' : '中午新增預約清單') + ' — ' + esc(displayDate(todayStr())) + '</div>' +
+      '<div class="text-xs text-gray-500">產出時間：' + esc(stamp) + '　共 ' + list.length + ' 筆' + (s.noonShowAll ? '' : '（' + cutoffLabel + ' 之後新增/異動）') + '</div></div>' +
+      (s.noonLoading && ap.state.noonBookings.length === 0 ? '<div class="text-center py-12 text-gray-400">資料載入中...</div>' :
+        list.length === 0 ? '<div class="text-center py-12 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200 text-gray-500 font-medium">' + (s.noonShowAll ? '今天下午沒有任何有效預約' : cutoffLabel + ' 之後沒有新增或改到今天下午的預約') + '</div>' :
+          '<div class="overflow-x-auto rounded-xl border border-gray-200"><table class="min-w-full divide-y divide-gray-200 text-sm">' +
+          '<thead class="bg-gray-50"><tr>' + ['時段', '供應商', '交貨地點', '預約代碼', '堆高機', '預約時間', '類型'].map(function (h) { return '<th class="px-4 py-3 text-left text-xs font-bold text-gray-500 uppercase">' + h + '</th>' }).join('') + '</tr></thead>' +
+          '<tbody class="bg-white divide-y divide-gray-100">' +
+          list.map(function (b) {
+            return '<tr>' +
+              '<td class="px-4 py-3 whitespace-nowrap font-bold text-blue-700">' + esc(b.time) + '</td>' +
+              '<td class="px-4 py-3 whitespace-nowrap font-bold text-gray-900">' + esc(b.supplierName) + '</td>' +
+              '<td class="px-4 py-3 text-gray-700">' + esc(b.location || '未指定') + '</td>' +
+              '<td class="px-4 py-3 whitespace-nowrap font-mono text-purple-700">' + esc(b.bookingCode) + '</td>' +
+              '<td class="px-4 py-3 whitespace-nowrap">' + (b.needForklift === 'yes' ? '需要' : '—') + '</td>' +
+              '<td class="px-4 py-3 whitespace-nowrap text-gray-500">' + esc(fmtTime(b.noonKind === 'moved' ? b.updatedAt : b.createdAt)) + '</td>' +
+              '<td class="px-4 py-3 whitespace-nowrap">' + kindBadge(b.noonKind) + '</td>' +
+              '</tr>'
+          }).join('') + '</tbody></table></div>') +
+      '</div></div></div>'
+  },
+
+  loadNoonBookings: function () {
+    var s = ap.state
+    s.noonLoading = true
+    ap.render()
+    var today = todayStr()
+    api('listBookings', { token: s.token, start: today, end: today }).then(function (data) {
+      s.noonBookings = data.bookings || []
+      s.noonLoading = false
+      ap.render()
+    }).catch(function (err) {
+      s.noonLoading = false
+      if (ap.isAuthErr(err)) { ap.forceLogout('登入已逾期，請重新登入'); return }
+      alert('讀取今日預約失敗：' + (err.message || ''))
+      ap.render()
+    })
+  },
+
+  exportNoon: function () {
+    var list = ap.noonList()
+    if (list.length === 0) return
+    var s = ap.state
+    s.noonExporting = true
+    ap.render()
+    loadXLSX().then(function (XLSX) {
+      var rows = list.map(function (b) {
+        var d = new Date(b.noonKind === 'moved' ? b.updatedAt : b.createdAt)
+        return {
+          日期: displayDate(b.date), 時段: b.time, 供應商: b.supplierName, 交貨地點: b.location || '', 預約代碼: b.bookingCode, Email: b.email,
+          堆高機需求: b.needForklift === 'yes' ? '是' : '否',
+          類型: b.noonKind === 'new' ? '新增' : (b.noonKind === 'moved' ? '改期/改時段' : '早上已出單'),
+          預約時間: isNaN(d) ? '' : (String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')),
+        }
+      })
+      var ws = XLSX.utils.json_to_sheet(rows)
+      var wb = XLSX.utils.book_new()
+      XLSX.utils.book_append_sheet(wb, ws, '中午新增預約')
+      XLSX.writeFile(wb, '中午新增預約_' + todayStr() + '.xlsx')
+      toast.push({ type: 'success', title: '匯出成功', message: '已下載 ' + rows.length + ' 筆中午新增預約' })
+      s.noonExporting = false
+      ap.render()
+    }).catch(function (err) {
+      console.error('Export failed:', err)
+      alert('匯出 Excel 失敗，請檢查網路連線後重試')
+      s.noonExporting = false
+      ap.render()
+    })
   },
 
   loadBookings: function () {
@@ -1098,9 +1229,12 @@ var ap = {
         '<input type="date" data-onchange="range-end" value="' + esc(s.range.end || '') + '" class="p-1 border-none outline-none text-sm font-medium text-gray-600" />' +
         '</div>' : '') +
       '<p class="text-xs text-gray-400 w-full basis-full">此區間僅決定「預約列表」跟「搜尋」顯示的資料範圍，不代表僅有此範圍內有預約</p></div>' +
+      '<div class="flex gap-2 flex-wrap justify-end">' +
+      '<button data-action="open-noon" class="flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold rounded-xl transition shadow-md" title="列出今天早上 07:45 出單後才新增或改到「今天下午」時段的預約">' +
+      '<i data-lucide="sun" class="h-4 w-4"></i> 中午新增預約</button>' +
       '<button data-action="export" ' + (s.exporting ? 'disabled' : '') + ' class="flex items-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-xl transition shadow-md ' + (s.exporting ? 'opacity-70 cursor-wait' : '') + '">' +
       (s.exporting ? '匯出中...' : '<i data-lucide="download" class="h-4 w-4"></i> 匯出報表') + '</button>' +
-      '</div>' +
+      '</div></div>' +
       '<div class="relative w-full"><i data-lucide="search" class="absolute left-4 top-3.5 h-4 w-4 text-gray-400"></i>' +
       '<input type="text" data-oninput="admin-search" value="' + esc(s.search) + '" placeholder="搜尋預約：供應商名稱、Email 或 預約代碼（僅搜尋目前日期區間內）" class="w-full pl-11 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm bg-white shadow-sm" /></div>' +
       '</div>' +
@@ -1221,6 +1355,7 @@ var ap = {
     }
     if (action === 'range-start') { s.range.start = target.value; ap.loadBookings(); return }
     if (action === 'range-end') { s.range.end = target.value; ap.loadBookings(); return }
+    if (action === 'noon-show-all') { s.noonShowAll = target.checked; ap.render(); return }
     if (ap.state.view === 'rules' && rm.onChange) return rm.onChange(action, target)
     if (ap.state.view === 'suppliers' && sm.onChange) return sm.onChange(action, target)
   },
@@ -1250,6 +1385,11 @@ var ap = {
     }
     if (action === 'logout') { ap.forceLogout(''); return }
     if (action === 'export') { ap.handleExport(); return }
+    if (action === 'open-noon') { s.showNoonModal = true; s.noonBookings = []; ap.loadNoonBookings(); return }
+    if (action === 'close-noon' || action === 'close-noon-backdrop') { s.showNoonModal = false; ap.render(); return }
+    if (action === 'noon-refresh') { ap.loadNoonBookings(); return }
+    if (action === 'noon-export') { ap.exportNoon(); return }
+    if (action === 'noon-print') { window.print(); return }
     if (action === 'toggle-cancelled') { s.showCancelled = !s.showCancelled; ap.renderTableArea(ap.filteredBookings().filter(function (b) { return b.status !== 'cancelled' }), ap.filteredBookings().filter(function (b) { return b.status === 'cancelled' })); return }
     if (action === 'mark-complete') {
       var id = target.getAttribute('data-id')
