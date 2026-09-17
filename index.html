@@ -189,14 +189,16 @@ function computeAvailability(opts) {
   })
 
   if (includeCutoff) {
+    var cutoffBlockedDay = false
     TIME_SLOTS.forEach(function (slot) {
       var lock = cutoffHint(date, slot)
       if (lock.locked) {
         availability[slot].available = false
         if (!availability[slot].reason) availability[slot].reason = '已過時限'
-        if (lock.reason.indexOf('今日出單') >= 0) dayBlocked = true
+        if (lock.reason.indexOf('今日出單') >= 0) { dayBlocked = true; cutoffBlockedDay = true }
       }
     })
+    if (cutoffBlockedDay) messages.push('今日出單時間已過 (12:45)，今日已無法預約，請選擇其他日期')
   }
 
   if (!dayBlocked) {
@@ -246,15 +248,33 @@ function computeAvailability(opts) {
 /* ============================================================
  * 全域資料快取（開站時抓一次，各分頁共用）
  * ============================================================ */
-var GLOBAL = { suppliers: [], rules: [], config: { minDate: minBookableDateStr(), maxDate: maxBookableDateStr() }, loaded: false }
+var GLOBAL = { suppliers: [], rules: [], announcements: [], config: { minDate: minBookableDateStr(), maxDate: maxBookableDateStr() }, loaded: false }
 
 function loadBootstrap() {
   return api('bootstrap').then(function (data) {
     GLOBAL.suppliers = data.suppliers || []
     GLOBAL.rules = data.rules || []
+    GLOBAL.announcements = data.announcements || []
     GLOBAL.config = data.config || GLOBAL.config
     GLOBAL.loaded = true
   })
+}
+function refreshAnnouncements(cb) {
+  api('listAnnouncements').then(function (data) { GLOBAL.announcements = data.announcements || []; if (cb) cb() }).catch(function () {})
+}
+// 公告橫幅：顯示在預約交貨 / 管理預約頁最上方，內容由後台「公告設定」維護
+function renderAnnouncementBanner() {
+  var list = GLOBAL.announcements || []
+  if (list.length === 0) return ''
+  return '' +
+    '<div class="space-y-3 mb-6">' +
+    list.map(function (a) {
+      return '' +
+        '<div class="bg-amber-50 border border-amber-200 rounded-2xl p-4 shadow-sm flex items-start gap-3">' +
+        '<i data-lucide="megaphone" class="h-5 w-5 text-amber-600 shrink-0 mt-0.5"></i>' +
+        '<p class="text-sm text-amber-900 whitespace-pre-wrap">' + esc(a.message) + '</p></div>'
+    }).join('') +
+    '</div>'
 }
 function watchRulesPoll(cb) {
   loadBootstrap().then(function () { cb(GLOBAL.rules) }).catch(function () {})
@@ -299,7 +319,9 @@ var mb = {
     if (!mb.host) return
     var s = mb.state
     mb.host.innerHTML = '' +
-      '<div class="max-w-xl mx-auto mt-8 p-6 bg-white rounded-2xl shadow-lg border border-gray-100">' +
+      '<div class="max-w-xl mx-auto mt-8">' +
+      renderAnnouncementBanner() +
+      '<div class="p-6 bg-white rounded-2xl shadow-lg border border-gray-100">' +
       '<div class="mb-8 border-b pb-6"><h2 class="text-2xl font-bold text-gray-800 flex items-center gap-3"><i data-lucide="clipboard-list" class="h-6 w-6 text-purple-600"></i> 管理預約</h2>' +
       '<p class="text-gray-500 mt-2">輸入預約時的 Email <span class="text-purple-600 font-bold">或</span> 預約代碼即可查詢。</p></div>' +
 
@@ -314,7 +336,7 @@ var mb = {
       (s.error ? '<div class="bg-red-50 text-red-700 p-4 rounded-xl text-sm flex items-center gap-2 mb-6"><i data-lucide="alert-circle" class="h-5 w-5 shrink-0"></i>' + esc(s.error) + '</div>' : '') +
 
       '<div class="space-y-4">' + s.results.map(mb.renderBookingCard).join('') + '</div>' +
-      '</div>'
+      '</div></div>'
     refreshIcons()
   },
 
@@ -643,7 +665,7 @@ var bf = {
     if (!GLOBAL.loaded) loadBootstrap().then(bf.render).catch(function (e) { console.error(e) })
     bf.refreshSlotCounts()
     if (bf.pollTimer) clearInterval(bf.pollTimer)
-    bf.pollTimer = setInterval(function () { if (appState.activeTab === 'book') bf.refreshSlotCounts() }, 15000)
+    bf.pollTimer = setInterval(function () { if (appState.activeTab === 'book') { bf.refreshSlotCounts(); refreshAnnouncements(bf.render) } }, 15000)
   },
 
   resetForm: function (keepNothing) {
@@ -664,7 +686,7 @@ var bf = {
   },
 
   currentAvailability: function () {
-    return computeAvailability({ date: bf.state.form.date, locations: bf.state.form.locations, rules: GLOBAL.rules, slotCounts: bf.state.slotCounts })
+    return computeAvailability({ date: bf.state.form.date, locations: bf.state.form.locations, rules: GLOBAL.rules, slotCounts: bf.state.slotCounts, includeCutoff: true })
   },
 
   render: function () {
@@ -709,6 +731,7 @@ var bf = {
 
     return '' +
       '<div class="max-w-3xl mx-auto mt-8">' +
+      renderAnnouncementBanner() +
       '<div class="bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-100 rounded-2xl p-5 mb-8 shadow-sm">' +
       '<div class="flex items-start gap-4"><div class="p-2 bg-blue-100 rounded-full shrink-0"><i data-lucide="info" class="h-6 w-6 text-blue-600"></i></div>' +
       '<div><h3 class="font-bold text-blue-900 text-lg mb-2">預約規則須知</h3>' +
@@ -795,7 +818,7 @@ var bf = {
     var visibleSlots = TIME_SLOTS.filter(function (slot) { return parcelSelected ? slot === PARCEL_ONLY_SLOT : slot !== PARCEL_ONLY_SLOT })
     var result = bf.currentAvailability()
     var disabledSelect = !f.date || f.locations.length === 0 || parcelSelected || result.dayBlocked
-    var placeholder = !f.date ? '請先選擇預約日期' : (f.locations.length === 0 ? '請先選擇交貨地點' : (result.dayBlocked ? '此日期暫停預約' : (parcelSelected ? '已自動鎖定包裹專用時段' : '請選擇時段')))
+    var placeholder = !f.date ? '請先選擇預約日期' : (f.locations.length === 0 ? '請先選擇交貨地點' : (result.dayBlocked ? (result.messages[0] || '此日期暫停預約') : (parcelSelected ? '已自動鎖定包裹專用時段' : '請選擇時段')))
 
     box.innerHTML = '' +
       '<i data-lucide="clock" class="absolute left-3 top-3 h-5 w-5 text-gray-400 z-10"></i>' +
@@ -991,6 +1014,7 @@ var ap = {
     var sub = qs('#admin-subview')
     if (ap.state.view === 'rules') rm.mount(sub)
     else if (ap.state.view === 'suppliers') sm.mount(sub)
+    else if (ap.state.view === 'announcements') an.mount(sub)
     else ap.renderListView(sub)
   },
 
@@ -1021,7 +1045,7 @@ var ap = {
       (s.view === 'list' ? '<p class="text-sm text-gray-500 mt-1 font-medium">' + esc(rangeLabel) + '</p>' : '') + '</div>' +
       '<div class="flex flex-wrap gap-3 w-full xl:w-auto items-center">' +
       '<div class="flex bg-slate-100 p-1.5 rounded-xl overflow-x-auto">' +
-      ['list:預約列表', 'rules:規則設定', 'suppliers:供應商'].map(function (pair) {
+      ['list:預約列表', 'rules:規則設定', 'suppliers:供應商', 'announcements:公告設定'].map(function (pair) {
         var parts = pair.split(':'); var v = parts[0], label = parts[1]
         return '<button data-action="set-view" data-view="' + v + '" class="px-4 py-2 rounded-lg text-sm font-bold whitespace-nowrap transition-all ' + (s.view === v ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700') + '">' + label + '</button>'
       }).join('') +
@@ -1327,6 +1351,7 @@ var ap = {
     }
     if (ap.state.view === 'rules' && rm.onSubmit) return rm.onSubmit(action, form)
     if (ap.state.view === 'suppliers' && sm.onSubmit) return sm.onSubmit(action, form)
+    if (ap.state.view === 'announcements' && an.onSubmit) return an.onSubmit(action, form)
   },
 
   onInput: function (action, target) {
@@ -1337,6 +1362,7 @@ var ap = {
     if (action === 'admin-search') { s.search = target.value; ap.renderTableArea(ap.filteredBookings().filter(function (b) { return b.status !== 'cancelled' }), ap.filteredBookings().filter(function (b) { return b.status === 'cancelled' })); return }
     if (ap.state.view === 'rules' && rm.onInput) return rm.onInput(action, target)
     if (ap.state.view === 'suppliers' && sm.onInput) return sm.onInput(action, target)
+    if (ap.state.view === 'announcements' && an.onInput) return an.onInput(action, target)
   },
 
   onChange: function (action, target) {
@@ -1358,6 +1384,7 @@ var ap = {
     if (action === 'noon-show-all') { s.noonShowAll = target.checked; ap.render(); return }
     if (ap.state.view === 'rules' && rm.onChange) return rm.onChange(action, target)
     if (ap.state.view === 'suppliers' && sm.onChange) return sm.onChange(action, target)
+    if (ap.state.view === 'announcements' && an.onChange) return an.onChange(action, target)
   },
 
   onClick: function (action, target) {
@@ -1413,6 +1440,7 @@ var ap = {
     }
     if (ap.state.view === 'rules' && rm.onClick) return rm.onClick(action, target)
     if (ap.state.view === 'suppliers' && sm.onClick) return sm.onClick(action, target)
+    if (ap.state.view === 'announcements' && an.onClick) return an.onClick(action, target)
   },
 
   handleExport: function () {
@@ -1992,6 +2020,170 @@ var sm = {
       s.submitting = false
       if (!sm.authGuard(err)) alert('匯入失敗: ' + (err.message || ''))
       sm.render()
+    })
+  },
+}
+
+/* ============================================================
+ * 公告設定（後台管理，對應 GLOBAL.announcements 的維護介面）
+ * ============================================================ */
+var an = {
+  host: null,
+  state: {
+    list: [], loading: false, form: { message: '', active: true }, editingId: null,
+    submitting: false, togglingId: null, deletingId: null,
+  },
+
+  mount: function (host) {
+    an.host = host
+    an.state.editingId = null
+    an.state.form = { message: '', active: true }
+    an.render()
+    an.reload()
+  },
+
+  authGuard: function (err) { if (ap.isAuthErr(err)) { ap.forceLogout('登入已逾期，請重新登入'); return true } return false },
+
+  reload: function () {
+    an.state.loading = true
+    an.render()
+    api('adminListAnnouncements', { token: ap.state.token }).then(function (data) {
+      an.state.list = data.announcements || []
+      an.state.loading = false
+      an.render()
+    }).catch(function (err) {
+      an.state.loading = false
+      if (!an.authGuard(err)) alert('讀取公告失敗')
+      an.render()
+    })
+  },
+
+  // 後台維護完公告後，順便同步一份給預約頁/管理預約頁用的 GLOBAL.announcements（只含啟用中的）
+  syncGlobal: function () { refreshAnnouncements() },
+
+  render: function () {
+    if (!an.host) return
+    var s = an.state
+    var f = s.form
+    an.host.innerHTML = '' +
+      '<div class="bg-white rounded-xl p-6 border border-gray-200 shadow-sm mt-4">' +
+      '<div class="flex justify-between items-center mb-2"><h3 class="text-lg font-bold text-gray-800 flex items-center gap-2"><i data-lucide="megaphone" class="h-5 w-5"></i> 公告設定</h3></div>' +
+      '<p class="text-xs text-gray-500 mb-6">在這裡新增的「啟用中」公告，會顯示在供應商的「預約交貨」與「管理預約」頁面最上方，方便通知停班停電、系統維護、規則調整等事項。</p>' +
+
+      '<div class="bg-slate-50 p-5 rounded-xl border border-slate-200 mb-6 space-y-3">' +
+      '<label class="block text-xs font-bold text-gray-500">' + (s.editingId ? '編輯公告內容' : '新增公告內容') + '</label>' +
+      '<textarea data-oninput="an-message" rows="3" class="w-full px-4 py-3 border border-gray-300 rounded-lg outline-none focus:ring-2 focus:ring-slate-500 text-sm" placeholder="輸入公告內容，例如：9/20（六）9/21（日）公司放假，暫停收貨，請提前預約。">' + esc(f.message) + '</textarea>' +
+      '<div class="flex items-center justify-between flex-wrap gap-3">' +
+      '<label class="flex items-center gap-2 text-sm text-gray-700 cursor-pointer"><input type="checkbox" data-onchange="an-active" ' + (f.active ? 'checked' : '') + ' class="w-4 h-4" /> 立即啟用（顯示在對外頁面）</label>' +
+      '<div class="flex gap-2">' +
+      (s.editingId ? '<button data-action="an-cancel-edit" class="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-bold">取消編輯</button>' : '') +
+      '<button data-action="an-submit" ' + (s.submitting ? 'disabled' : '') + ' class="px-6 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900 transition disabled:opacity-50 font-bold">' +
+      (s.submitting ? '處理中...' : (s.editingId ? '儲存修改' : '新增公告')) + '</button>' +
+      '</div></div></div>' +
+
+      '<div id="announcement-list-area"></div></div>'
+    refreshIcons()
+    an.renderList()
+  },
+
+  renderList: function () {
+    var area = qs('#announcement-list-area')
+    if (!area) return
+    var s = an.state
+    if (s.loading && s.list.length === 0) { area.innerHTML = '<div class="text-center py-10 text-gray-400">資料載入中...</div>'; refreshIcons(); return }
+    if (s.list.length === 0) { area.innerHTML = '<div class="text-center py-10 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200 text-gray-500 font-medium">目前沒有任何公告</div>'; refreshIcons(); return }
+    area.innerHTML = '<div class="space-y-3">' +
+      s.list.map(function (a) {
+        return '' +
+          '<div class="border rounded-xl p-4 flex items-start gap-3 ' + (a.active ? 'border-amber-200 bg-amber-50/50' : 'border-gray-200 bg-gray-50 opacity-70') + '">' +
+          '<i data-lucide="megaphone" class="h-5 w-5 mt-0.5 shrink-0 ' + (a.active ? 'text-amber-600' : 'text-gray-400') + '"></i>' +
+          '<div class="flex-1 min-w-0">' +
+          '<p class="text-sm text-gray-800 whitespace-pre-wrap break-words">' + esc(a.message) + '</p>' +
+          '<p class="text-xs text-gray-400 mt-1">' + (a.active ? '<span class="text-green-600 font-bold">啟用中</span>' : '<span class="text-gray-400 font-bold">已停用</span>') + '　建立於 ' + formatTimestamp(a.createdAt) + '</p></div>' +
+          '<div class="flex gap-1 shrink-0">' +
+          '<button data-action="an-toggle" data-id="' + a.id + '" ' + (s.togglingId === a.id ? 'disabled' : '') + ' title="' + (a.active ? '停用' : '啟用') + '" class="p-2 text-gray-400 hover:text-slate-700 hover:bg-gray-100 rounded-lg transition"><i data-lucide="' + (a.active ? 'eye-off' : 'eye') + '" class="h-4 w-4"></i></button>' +
+          '<button data-action="an-edit" data-id="' + a.id + '" title="編輯" class="p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-lg transition"><i data-lucide="pencil" class="h-4 w-4"></i></button>' +
+          '<button data-action="an-delete" data-id="' + a.id + '" ' + (s.deletingId === a.id ? 'disabled' : '') + ' title="刪除" class="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"><i data-lucide="trash-2" class="h-4 w-4"></i></button>' +
+          '</div></div>'
+      }).join('') + '</div>'
+    refreshIcons()
+  },
+
+  onInput: function (action, target) {
+    if (action === 'an-message') { an.state.form.message = target.value; return }
+  },
+
+  onChange: function (action, target) {
+    if (action === 'an-active') { an.state.form.active = target.checked; return }
+  },
+
+  onClick: function (action, target) {
+    var s = an.state
+    if (action === 'an-submit') { an.handleSubmit(); return }
+    if (action === 'an-cancel-edit') { s.editingId = null; s.form = { message: '', active: true }; an.render(); return }
+    if (action === 'an-edit') {
+      var id = target.getAttribute('data-id')
+      var item = s.list.filter(function (a) { return a.id === id })[0]
+      if (!item) return
+      s.editingId = id
+      s.form = { message: item.message, active: item.active }
+      an.render()
+      return
+    }
+    if (action === 'an-toggle') {
+      var tid = target.getAttribute('data-id')
+      var t = s.list.filter(function (a) { return a.id === tid })[0]
+      if (!t) return
+      s.togglingId = tid
+      an.renderList()
+      api('updateAnnouncement', { token: ap.state.token, id: tid, active: !t.active }).then(function () {
+        s.togglingId = null
+        an.syncGlobal()
+        an.reload()
+      }).catch(function (err) {
+        s.togglingId = null
+        if (!an.authGuard(err)) alert('更新失敗')
+        an.renderList()
+      })
+      return
+    }
+    if (action === 'an-delete') {
+      if (!window.confirm('確定刪除這則公告？')) return
+      var did = target.getAttribute('data-id')
+      s.deletingId = did
+      an.renderList()
+      api('deleteAnnouncement', { token: ap.state.token, id: did }).then(function () {
+        s.deletingId = null
+        an.syncGlobal()
+        an.reload()
+      }).catch(function (err) {
+        s.deletingId = null
+        if (!an.authGuard(err)) alert('刪除失敗')
+        an.renderList()
+      })
+      return
+    }
+  },
+
+  handleSubmit: function () {
+    var s = an.state
+    var f = s.form
+    if (!f.message.trim()) { alert('請輸入公告內容'); return }
+    s.submitting = true
+    an.render()
+    var req = s.editingId
+      ? api('updateAnnouncement', { token: ap.state.token, id: s.editingId, message: f.message, active: f.active })
+      : api('addAnnouncement', { token: ap.state.token, message: f.message, active: f.active })
+    req.then(function () {
+      s.submitting = false
+      s.editingId = null
+      s.form = { message: '', active: true }
+      an.syncGlobal()
+      an.reload()
+    }).catch(function (err) {
+      s.submitting = false
+      if (!an.authGuard(err)) alert((s.editingId ? '更新' : '新增') + '失敗: ' + (err.message || ''))
+      an.render()
     })
   },
 }
