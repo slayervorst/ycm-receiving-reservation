@@ -82,6 +82,24 @@ function loadXLSX() {
   })
 }
 
+// ExcelJS 只用在「匯出交貨清單」這個功能（需要框線、粗體、置中等儲存格樣式，前面的 xlsx.js 社群版無法產生），
+// 平常不會載入，只有管理員點擊該按鈕時才會動態載入，避免拖慢一般供應商使用的頁面。
+var EXCELJS_URL = 'https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js'
+var EXCELJS_SRI = 'sha384-Pqp51FUN2/qzfxZxBCtF0stpc9ONI6MYZpVqmo8m20SoaQCzf+arZvACkLkirlPz'
+function loadExcelJS() {
+  return new Promise(function (resolve, reject) {
+    if (window.ExcelJS) return resolve(window.ExcelJS)
+    var script = document.createElement('script')
+    script.src = EXCELJS_URL
+    script.integrity = EXCELJS_SRI
+    script.crossOrigin = 'anonymous'
+    script.referrerPolicy = 'no-referrer'
+    script.onload = function () { window.ExcelJS ? resolve(window.ExcelJS) : reject(new Error('ExcelJS load failed')) }
+    script.onerror = function () { reject(new Error('ExcelJS script blocked or tampered (SRI mismatch)')) }
+    document.head.appendChild(script)
+  })
+}
+
 /* ============================================================
  * 後端 API
  * ============================================================ */
@@ -120,6 +138,11 @@ function cutoffHint(dateStr, timeSlot) {
   return { locked: false }
 }
 function displayDate(dateStr) { return dateStr ? dateStr.replace(/-/g, '/') : '' }
+function displayDateNoPad(dateStr) {
+  if (!dateStr) return ''
+  var p = dateStr.split('-')
+  return p[0] + '/' + parseInt(p[1], 10) + '/' + parseInt(p[2], 10)
+}
 function formatTimestamp(ts) {
   if (!ts) return '-'
   var d = new Date(ts)
@@ -1258,8 +1281,8 @@ var ap = {
       '<i data-lucide="refresh-cw" class="h-4 w-4' + (s.loadingList ? ' animate-spin' : '') + '"></i> ' + (s.loadingList ? '刷新中...' : '立即刷新') + '</button>' +
       '<button data-action="open-noon" class="flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold rounded-xl transition shadow-md" title="列出今天早上 07:45 出單後才新增或改到「今天下午」時段的預約">' +
       '<i data-lucide="sun" class="h-4 w-4"></i> 中午新增預約</button>' +
-      '<button data-action="export" ' + (s.exporting ? 'disabled' : '') + ' class="flex items-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-xl transition shadow-md ' + (s.exporting ? 'opacity-70 cursor-wait' : '') + '">' +
-      (s.exporting ? '匯出中...' : '<i data-lucide="download" class="h-4 w-4"></i> 匯出報表') + '</button>' +
+      '<button data-action="export" ' + (s.exporting ? 'disabled' : '') + ' class="flex items-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-xl transition shadow-md ' + (s.exporting ? 'opacity-70 cursor-wait' : '') + '" title="匯出目前日期區間內的廠商交貨清單（可用 Excel 列印，末尾附無預約登記表）">' +
+      (s.exporting ? '匯出中...' : '<i data-lucide="download" class="h-4 w-4"></i> 匯出交貨清單') + '</button>' +
       '</div></div>' +
       '<div class="relative w-full"><i data-lucide="search" class="absolute left-4 top-3.5 h-4 w-4 text-gray-400"></i>' +
       '<input type="text" data-oninput="admin-search" value="' + esc(s.search) + '" placeholder="搜尋預約：供應商名稱、Email 或 預約代碼（僅搜尋目前日期區間內）" class="w-full pl-11 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 outline-none text-sm bg-white shadow-sm" /></div>' +
@@ -1446,28 +1469,157 @@ var ap = {
     if (ap.state.view === 'announcements' && an.onClick) return an.onClick(action, target)
   },
 
+  // 匯出「廠商交貨清單」：依日期分組，同一天內「同時段 + 同交貨類型 + 同堆高機需求」的多家廠商合併成同一列
+  // （公司名稱以「、」分隔），並在清單後面固定附上空白列（供臨時手寫增補）與一份「無預約登記表」空白樣板，
+  // 版面（標題、框線、粗體、置中）比照使用者提供的紙本範例。用 ExcelJS 才能寫入儲存格樣式
+  // （純 xlsx.js 社群版只能寫資料、無法寫框線/粗體/置中，所以這個匯出改用 ExcelJS，只有按這顆按鈕時才會動態載入）。
+  // 每筆預約各自一列（不合併同時段/同交貨類型的廠商），只依「時段 → 交貨類型 → 公司名稱」排序方便閱讀。
+  groupDeliveryRows_: function (bookings) {
+    var timeIndex = {}
+    TIME_SLOTS.forEach(function (t, i) { timeIndex[t] = i })
+    var rows = bookings.map(function (b) {
+      return { time: b.time, location: b.location || '', needForklift: b.needForklift === 'yes' ? 'yes' : 'no', names: [b.supplierName] }
+    })
+    return rows.sort(function (a, c) {
+      var ta = timeIndex[a.time] != null ? timeIndex[a.time] : 999
+      var tc = timeIndex[c.time] != null ? timeIndex[c.time] : 999
+      if (ta !== tc) return ta - tc
+      if (a.location !== c.location) return a.location.localeCompare(c.location)
+      return a.names[0].localeCompare(c.names[0])
+    })
+  },
+
+  buildDeliveryListWorkbook_: function (ExcelJS, active) {
+    var BLANK_ROWS = 6
+    var THIN = { style: 'thin', color: { argb: 'FF000000' } }
+    var BORDER = { top: THIN, left: THIN, bottom: THIN, right: THIN }
+
+    var byDate = {}
+    active.forEach(function (b) { (byDate[b.date] = byDate[b.date] || []).push(b) })
+    var dates = Object.keys(byDate).sort()
+
+    var wb = new ExcelJS.Workbook()
+    var ws = wb.addWorksheet('交貨清單', {
+      pageSetup: { fitToPage: true, fitToWidth: 1, fitToHeight: 0, orientation: 'portrait', margins: { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.2, footer: 0.2 } },
+      views: [{ showGridLines: false }],
+    })
+    // 8 個基準欄位寬度一致，兩張表各自用合併儲存格拼出需要的欄寬，避免兩張表欄位定義互相打架
+    ;[13, 13, 13, 13, 16, 13, 13, 13].forEach(function (w, i) { ws.getColumn(i + 1).width = w })
+
+    // spans: [{ from, to, value, align, bold, size, fill, border }]，from/to 為欄位（1-based）
+    function putRow(rowNum, spans, rowHeight) {
+      spans.forEach(function (sp) {
+        if (sp.to > sp.from) ws.mergeCells(rowNum, sp.from, rowNum, sp.to)
+        var cell = ws.getCell(rowNum, sp.from)
+        cell.value = sp.value
+        cell.alignment = { vertical: 'middle', wrapText: true, horizontal: sp.align || 'left' }
+        if (sp.bold || sp.size) cell.font = { bold: !!sp.bold, size: sp.size || 12 }
+        if (sp.border !== false) {
+          for (var c2 = sp.from; c2 <= sp.to; c2++) {
+            ws.getCell(rowNum, c2).border = BORDER
+            if (sp.fill) ws.getCell(rowNum, c2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } }
+          }
+        }
+      })
+      if (rowHeight) ws.getRow(rowNum).height = rowHeight
+    }
+
+    var rowNum = 1
+    dates.forEach(function (date, dateIdx) {
+      var label = displayDateNoPad(date)
+      var rows = ap.groupDeliveryRows_(byDate[date])
+
+      putRow(rowNum, [{ from: 1, to: 8, value: label + ' 廠商交貨清單', align: 'center', bold: true, size: 18, border: false }], 30)
+      rowNum++
+
+      putRow(rowNum, [
+        { from: 1, to: 2, value: '公司名稱', align: 'center', bold: true, fill: true },
+        { from: 3, to: 4, value: '交貨時間', align: 'center', bold: true, fill: true },
+        { from: 5, to: 5, value: '是否需堆高機', align: 'center', bold: true, fill: true },
+        { from: 6, to: 7, value: '交貨類型', align: 'center', bold: true, fill: true },
+        { from: 8, to: 8, value: '實到時間', align: 'center', bold: true, fill: true },
+      ], 30)
+      rowNum++
+
+      rows.forEach(function (r) {
+        putRow(rowNum, [
+          { from: 1, to: 2, value: r.names.join('、') },
+          { from: 3, to: 4, value: r.time, align: 'center' },
+          { from: 5, to: 5, value: r.needForklift === 'yes' ? '需堆高機' : '不需堆高機', align: 'center' },
+          { from: 6, to: 7, value: r.location },
+          { from: 8, to: 8, value: '' },
+        ], 22)
+        rowNum++
+      })
+
+      for (var i = 0; i < BLANK_ROWS; i++) {
+        putRow(rowNum, [{ from: 1, to: 2, value: '' }, { from: 3, to: 4, value: '' }, { from: 5, to: 5, value: '' }, { from: 6, to: 7, value: '' }, { from: 8, to: 8, value: '' }], 22)
+        rowNum++
+      }
+
+      rowNum++ // 空白列間隔
+
+      putRow(rowNum, [{ from: 1, to: 8, value: '廠商交貨 無預約 登記表', align: 'center', bold: true, size: 18, border: false }], 30)
+      rowNum++
+      putRow(rowNum, [{ from: 1, to: 8, value: '日期：' + label, align: 'left', bold: true, size: 13, border: false }], 22)
+      rowNum++
+      putRow(rowNum, [
+        { from: 1, to: 1, value: '', align: 'center', bold: true, fill: true },
+        { from: 2, to: 2, value: '時間', align: 'center', bold: true, fill: true },
+        { from: 3, to: 4, value: '廠商名稱', align: 'center', bold: true, fill: true },
+        { from: 5, to: 5, value: '', align: 'center', bold: true, fill: true },
+        { from: 6, to: 6, value: '時間', align: 'center', bold: true, fill: true },
+        { from: 7, to: 8, value: '廠商名稱', align: 'center', bold: true, fill: true },
+      ], 22)
+      rowNum++
+      for (var n = 1; n <= 5; n++) {
+        putRow(rowNum, [
+          { from: 1, to: 1, value: n, align: 'center' },
+          { from: 2, to: 2, value: '' },
+          { from: 3, to: 4, value: '' },
+          { from: 5, to: 5, value: n + 5, align: 'center' },
+          { from: 6, to: 6, value: '' },
+          { from: 7, to: 8, value: '' },
+        ], 24)
+        rowNum++
+      }
+
+      if (dateIdx < dates.length - 1) {
+        ws.getRow(rowNum - 1).addPageBreak()
+        ws.getRow(rowNum).height = 14
+        rowNum++
+      }
+    })
+
+    return { workbook: wb, dates: dates }
+  },
+
   handleExport: function () {
     var active = ap.filteredBookings().filter(function (b) { return b.status !== 'cancelled' })
     if (active.length === 0) return
     ap.state.exporting = true
     ap.renderListView(qs('#admin-subview'))
-    loadXLSX().then(function (XLSX) {
-      var rows = active.map(function (b) {
-        return {
-          日期: displayDate(b.date), 時間: b.time, 預約代碼: b.bookingCode, 供應商: b.supplierName, Email: b.email,
-          交貨地點: b.location || '', 堆高機需求: b.needForklift === 'yes' ? '是' : '否', 狀態: b.status === 'completed' ? '已交貨' : '預約中',
-        }
+    loadExcelJS().then(function (ExcelJS) {
+      var built = ap.buildDeliveryListWorkbook_(ExcelJS, active)
+      return built.workbook.xlsx.writeBuffer().then(function (buf) {
+        var filename = built.dates.length <= 1
+          ? '交貨清單_' + (built.dates[0] || todayStr()) + '.xlsx'
+          : '交貨清單_' + built.dates[0] + '_至_' + built.dates[built.dates.length - 1] + '.xlsx'
+        var blob = new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })
+        var url = URL.createObjectURL(blob)
+        var a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        setTimeout(function () { URL.revokeObjectURL(url) }, 1000)
+        toast.push({ type: 'success', title: '匯出成功', message: '已下載 ' + active.length + ' 筆預約的交貨清單' })
       })
-      var ws = XLSX.utils.json_to_sheet(rows)
-      var wb = XLSX.utils.book_new()
-      XLSX.utils.book_append_sheet(wb, ws, '預約資料')
-      XLSX.writeFile(wb, '預約報表_' + todayStr() + '.xlsx')
-      toast.push({ type: 'success', title: '匯出成功', message: '已下載 ' + rows.length + ' 筆預約資料' })
-      ap.state.exporting = false
-      ap.renderListView(qs('#admin-subview'))
     }).catch(function (err) {
       console.error('Export failed:', err)
       alert('匯出 Excel 失敗，請檢查網路連線後重試')
+    }).then(function () {
       ap.state.exporting = false
       ap.renderListView(qs('#admin-subview'))
     })
