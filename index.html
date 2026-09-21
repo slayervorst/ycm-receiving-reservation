@@ -271,13 +271,14 @@ function computeAvailability(opts) {
 /* ============================================================
  * 全域資料快取（開站時抓一次，各分頁共用）
  * ============================================================ */
-var GLOBAL = { suppliers: [], rules: [], announcements: [], config: { minDate: minBookableDateStr(), maxDate: maxBookableDateStr() }, loaded: false }
+var GLOBAL = { suppliers: [], rules: [], announcements: [], purchasers: [], config: { minDate: minBookableDateStr(), maxDate: maxBookableDateStr() }, loaded: false }
 
 function loadBootstrap() {
   return api('bootstrap').then(function (data) {
     GLOBAL.suppliers = data.suppliers || []
     GLOBAL.rules = data.rules || []
     GLOBAL.announcements = data.announcements || []
+    GLOBAL.purchasers = data.purchasers || []
     GLOBAL.config = data.config || GLOBAL.config
     GLOBAL.loaded = true
   })
@@ -567,6 +568,7 @@ var appState = { activeTab: 'book' }
 var TABS = [
   { id: 'book', label: '預約交貨', icon: 'calendar-check' },
   { id: 'manage', label: '管理預約', icon: 'clipboard-list' },
+  { id: 'urgent', label: '急件預約', icon: 'zap' },
   { id: 'schedule', label: '中門收貨站管理', icon: 'shield-check' },
 ]
 
@@ -618,6 +620,7 @@ function renderPage() {
   var host = qs('#page-content')
   if (appState.activeTab === 'book') { host.innerHTML = ''; bf.mount(host) }
   else if (appState.activeTab === 'manage') { host.innerHTML = ''; mb.mount(host) }
+  else if (appState.activeTab === 'urgent') { host.innerHTML = ''; ub.mount(host) }
   else if (appState.activeTab === 'schedule') { host.innerHTML = ''; ap.mount(host) }
 }
 
@@ -636,6 +639,7 @@ document.addEventListener('click', function (e) {
   if (t.closest('#page-content')) {
     if (appState.activeTab === 'book' && bf.onClick) bf.onClick(action, t, e)
     else if (appState.activeTab === 'manage' && mb.onClick) mb.onClick(action, t, e)
+    else if (appState.activeTab === 'urgent' && ub.onClick) ub.onClick(action, t, e)
     else if (appState.activeTab === 'schedule' && ap.onClick) ap.onClick(action, t, e)
   }
 })
@@ -645,6 +649,7 @@ document.addEventListener('change', function (e) {
   var action = t.getAttribute('data-onchange')
   if (appState.activeTab === 'book' && bf.onChange) bf.onChange(action, t, e)
   else if (appState.activeTab === 'manage' && mb.onChange) mb.onChange(action, t, e)
+  else if (appState.activeTab === 'urgent' && ub.onChange) ub.onChange(action, t, e)
   else if (appState.activeTab === 'schedule' && ap.onChange) ap.onChange(action, t, e)
 })
 document.addEventListener('input', function (e) {
@@ -653,6 +658,7 @@ document.addEventListener('input', function (e) {
   var action = t.getAttribute('data-oninput')
   if (appState.activeTab === 'book' && bf.onInput) bf.onInput(action, t, e)
   else if (appState.activeTab === 'manage' && mb.onInput) mb.onInput(action, t, e)
+  else if (appState.activeTab === 'urgent' && ub.onInput) ub.onInput(action, t, e)
   else if (appState.activeTab === 'schedule' && ap.onInput) ap.onInput(action, t, e)
 })
 document.addEventListener('submit', function (e) {
@@ -662,10 +668,12 @@ document.addEventListener('submit', function (e) {
   var action = form.getAttribute('data-onsubmit')
   if (appState.activeTab === 'book' && bf.onSubmit) bf.onSubmit(action, form, e)
   else if (appState.activeTab === 'manage' && mb.onSubmit) mb.onSubmit(action, form, e)
+  else if (appState.activeTab === 'urgent' && ub.onSubmit) ub.onSubmit(action, form, e)
   else if (appState.activeTab === 'schedule' && ap.onSubmit) ap.onSubmit(action, form, e)
 })
 document.addEventListener('mousedown', function (e) {
   if (appState.activeTab === 'book' && bf.onOutsideMousedown) bf.onOutsideMousedown(e)
+  else if (appState.activeTab === 'urgent' && ub.onOutsideMousedown) ub.onOutsideMousedown(e)
 })
 
 /* ============================================================
@@ -967,6 +975,378 @@ var bf = {
 }
 
 /* ============================================================
+ * 急件臨時追加預約（供應商要先選對應採購員、輸入正確分機驗證通過後才能繼續填寫；
+ * 送出後可略過名額限制與出單時間鎖定 07:45/12:45，但週末、管理員封鎖規則仍然擋下 —
+ * 前端這裡只是「即時顯示用」的鏡像，真正把關一律是 Code.gs 的 actionCreateUrgentBooking_）
+ * ============================================================ */
+var ub = {
+  host: null,
+  verifyTimer: null,
+  state: {
+    form: { purchaserId: '', purchaserExt: '', supplierName: '', email: '', locations: [], date: todayStr(), time: '', needForklift: 'no', agreedToRules: false },
+    purchaserVerified: false, verifying: false, verifyError: '',
+    submitting: false, error: '', bookingCode: null,
+    suggestions: [], showSuggestions: false,
+    slotCounts: {}, locationNotice: '',
+  },
+
+  mount: function (host) {
+    ub.host = host
+    ub.resetForm()
+    ub.render()
+    if (!GLOBAL.loaded) loadBootstrap().then(ub.render).catch(function (e) { console.error(e) })
+    ub.refreshSlotCounts()
+  },
+
+  resetForm: function () {
+    ub.state.form = { purchaserId: '', purchaserExt: '', supplierName: '', email: '', locations: [], date: todayStr(), time: '', needForklift: 'no', agreedToRules: false }
+    ub.state.purchaserVerified = false
+    ub.state.verifying = false
+    ub.state.verifyError = ''
+    ub.state.bookingCode = null
+    ub.state.error = ''
+    ub.state.showSuggestions = false
+  },
+
+  refreshSlotCounts: function () {
+    var date = ub.state.form.date
+    if (!date) return
+    api('slotCounts', { date: date }).then(function (data) {
+      if (ub.state.form.date !== date) return
+      ub.state.slotCounts = data.slots || {}
+      ub.renderAvailability()
+    }).catch(function () {})
+  },
+
+  // 急件：略過名額限制與出單時間鎖定（includeCutoff:false），但仍尊重「這天/這時段本來就停收」
+  // （週末、或管理員設定的封鎖規則）—— 與後端 actionCreateUrgentBooking_ 的判斷邏輯保持一致
+  currentAvailability: function () {
+    return computeAvailability({ date: ub.state.form.date, locations: ub.state.form.locations, rules: GLOBAL.rules, slotCounts: ub.state.slotCounts, includeCutoff: false })
+  },
+
+  // 急件可選的時段：本來就可預約，或唯一被擋的原因剛好是「已額滿」（急件可以突破名額）
+  slotSelectable: function (a) {
+    return !!a && (a.available || a.reason === '已額滿')
+  },
+
+  render: function () {
+    if (!ub.host) return
+    if (ub.state.bookingCode) { ub.host.innerHTML = ub.renderSuccess(); refreshIcons(); return }
+    ub.host.innerHTML = ub.renderForm()
+    ub.renderAvailability()
+    refreshIcons()
+  },
+
+  renderSuccess: function () {
+    var code = ub.state.bookingCode
+    return '' +
+      '<div class="max-w-md mx-auto bg-white rounded-2xl shadow-xl overflow-hidden p-10 text-center mt-12 animate-fade-in border border-amber-100">' +
+      '<div class="flex justify-center mb-6"><div class="bg-amber-100 p-4 rounded-full"><i data-lucide="zap" class="h-16 w-16 text-amber-600"></i></div></div>' +
+      '<h2 class="text-3xl font-extrabold text-gray-800 mb-3">急件預約成功！</h2>' +
+      '<p class="text-gray-500 mb-8 text-lg">您的急件預約已送至系統。</p>' +
+      '<div class="bg-slate-50 p-6 rounded-2xl border border-slate-200 mb-8 max-w-sm mx-auto shadow-inner">' +
+      '<p class="text-sm text-slate-500 mb-2 uppercase tracking-wide font-semibold">您的預約代碼</p>' +
+      '<p class="text-5xl font-mono font-bold text-slate-800 tracking-widest">' + esc(code) + '</p>' +
+      '<p class="text-xs text-red-500 mt-4 font-medium flex items-center justify-center gap-1"><i data-lucide="alert-circle" class="h-3 w-3"></i> 此代碼僅用於預約管理使用</p></div>' +
+      '<p class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-8 max-w-sm mx-auto">請截圖或抄下此代碼，離開此頁面後將無法再次查看，之後可用此代碼於「管理預約」查詢或修改。</p>' +
+      '<button data-action="reset" class="w-full max-w-sm bg-amber-600 hover:bg-amber-700 text-white font-bold py-4 px-6 rounded-xl transition duration-200 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5">新增下一筆急件預約</button>' +
+      '</div>'
+  },
+
+  renderForm: function () {
+    var f = ub.state.form
+    var s = ub.state
+    var parcelSelected = f.locations.indexOf(PARCEL_LOCATION) >= 0
+    var gateOk = s.purchaserVerified
+
+    var purchaserOptions = '<option value="">請選擇對應採購員</option>' + (GLOBAL.purchasers || []).map(function (p) {
+      return '<option value="' + esc(p.id) + '" ' + (f.purchaserId === p.id ? 'selected' : '') + '>' + esc(p.name) + '</option>'
+    }).join('')
+
+    var locCards = LOCATIONS.map(function (loc) {
+      var selected = f.locations.indexOf(loc.name) >= 0
+      return '' +
+        '<div data-action="toggle-location" data-name="' + esc(loc.name) + '" class="relative flex items-center gap-3 p-4 rounded-xl cursor-pointer border-2 transition-all duration-200 select-none ' +
+        (selected ? 'border-amber-500 bg-amber-50/50 shadow-sm ring-1 ring-amber-500' : 'border-gray-200 hover:border-amber-300 hover:bg-gray-50') + '">' +
+        '<div class="p-2.5 rounded-full ' + (selected ? 'bg-amber-100 text-amber-600' : 'bg-gray-100 text-gray-500') + '"><i data-lucide="' + LOCATION_ICON[loc.id] + '" class="h-5 w-5"></i></div>' +
+        '<span class="block font-medium ' + (selected ? 'text-amber-900' : 'text-gray-700') + '">' + esc(loc.name) + '</span>' +
+        '<div class="absolute top-4 right-4 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ' + (selected ? 'border-amber-500 bg-amber-500' : 'border-gray-300') + '">' +
+        (selected ? '<i data-lucide="check" class="h-3 w-3 text-white"></i>' : '') + '</div></div>'
+    }).join('')
+
+    return '' +
+      '<div class="max-w-3xl mx-auto mt-8">' +
+      renderAnnouncementBanner() +
+      '<div class="bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-2xl p-5 mb-8 shadow-sm">' +
+      '<div class="flex items-start gap-4"><div class="p-2 bg-amber-100 rounded-full shrink-0"><i data-lucide="zap" class="h-6 w-6 text-amber-600"></i></div>' +
+      '<div><h3 class="font-bold text-amber-900 text-lg mb-2">急件臨時追加預約</h3>' +
+      '<ul class="space-y-1.5 text-sm text-amber-800 list-disc list-outside ml-4">' +
+      '<li>此頁專供「已與採購員確認、需臨時插單」的緊急交貨使用，<strong>可略過名額限制與出單時間鎖定 (07:45/12:45)</strong>。</li>' +
+      '<li>需先選擇對應採購員並輸入<strong>正確分機</strong>驗證通過後，才能繼續填寫其餘資料。</li>' +
+      '<li class="text-red-700 font-semibold">仍受週末公休、或管理員設定的暫停收貨規則（如盤點、廠休）限制，這些情況急件也無法預約。</li>' +
+      '</ul></div></div></div>' +
+
+      '<div class="bg-white rounded-2xl shadow-xl border border-amber-100 overflow-hidden">' +
+      '<div class="bg-amber-50 px-8 py-6 border-b border-amber-100">' +
+      '<h2 class="text-2xl font-bold text-gray-800 flex items-center gap-3"><i data-lucide="zap" class="h-7 w-7 text-amber-600"></i> 急件預約資料</h2>' +
+      '<p class="text-gray-500 mt-2">請先完成採購員驗證，再繼續填寫其餘資料。</p></div>' +
+
+      '<form data-onsubmit="urgent-book" class="p-8 space-y-8">' +
+      (s.error ? '<div class="bg-red-50 border-l-4 border-red-500 p-4 text-red-700 flex items-center gap-2 rounded-r-lg"><i data-lucide="alert-circle" class="h-5 w-5"></i><p class="font-medium">' + esc(s.error) + '</p></div>' : '') +
+
+      '<div class="bg-slate-50 p-5 rounded-xl border-2 ' + (gateOk ? 'border-green-300' : 'border-slate-200') + '">' +
+      '<label class="block text-sm font-bold text-gray-700 mb-3 flex items-center gap-2 flex-wrap">0. 對應採購員驗證 <span class="text-red-500">*</span>' +
+      (gateOk ? '<span class="inline-flex items-center gap-1 text-xs font-bold text-green-700 bg-green-100 px-2 py-0.5 rounded-full"><i data-lucide="check-circle-2" class="h-3 w-3"></i> 驗證成功，可繼續填寫</span>' : '') +
+      '</label>' +
+      '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">' +
+      '<select data-onchange="purchaser-select" class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none bg-white">' + purchaserOptions + '</select>' +
+      '<input type="text" inputmode="numeric" placeholder="輸入對應分機號碼" data-oninput="purchaser-ext" value="' + esc(f.purchaserExt) + '" ' +
+      'class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none" />' +
+      '</div>' +
+      (s.verifying ? '<p class="mt-2 text-xs text-gray-400">驗證中...</p>' : '') +
+      (!s.verifying && s.verifyError ? '<p class="mt-2 text-xs text-red-600 bg-red-50 border border-red-100 rounded-lg px-3 py-2">' + esc(s.verifyError) + '</p>' : '') +
+      '</div>' +
+
+      '<div class="grid grid-cols-1 md:grid-cols-2 gap-6 ' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '">' +
+      '<div><label class="block text-sm font-bold text-gray-700 mb-2">1. 供應商名稱 <span class="text-red-500">*</span></label>' +
+      '<div class="relative" id="urgent-supplier-box">' +
+      '<input type="text" ' + (gateOk ? 'required' : 'disabled') + ' autocomplete="off" placeholder="輸入關鍵字以搜尋..." data-oninput="supplier" value="' + esc(f.supplierName) + '" ' +
+      'class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none" />' +
+      '<ul id="urgent-supplier-suggestions" class="absolute z-10 w-full mt-1 bg-white border border-gray-200 rounded-xl shadow-lg max-h-60 overflow-y-auto hidden"></ul>' +
+      '</div></div>' +
+
+      '<div><label class="block text-sm font-bold text-gray-700 mb-2">Email 電子信箱 <span class="text-xs text-gray-400 font-normal">(僅查詢預約用)</span> <span class="text-red-500">*</span></label>' +
+      '<div class="relative"><i data-lucide="mail" class="absolute left-3 top-3.5 h-5 w-5 text-gray-400"></i>' +
+      '<input type="email" ' + (gateOk ? 'required' : 'disabled') + ' placeholder="name@company.com" data-oninput="email" value="' + esc(f.email) + '" ' +
+      'class="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none" /></div></div>' +
+      '</div>' +
+
+      '<div class="' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '"><label class="block text-sm font-bold text-gray-700 mb-3 flex justify-between"><span>2. 選擇交貨地點 <span class="text-red-500">*</span></span>' +
+      '<span class="text-xs font-normal text-gray-400">可複選 (包裹類除外)</span></label>' +
+      '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">' + locCards + '</div>' +
+      (s.locationNotice ? '<p class="mt-2 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 animate-fade-in">' + esc(s.locationNotice) + '</p>' : '') +
+      '</div>' +
+
+      '<div class="bg-slate-50 p-4 rounded-xl border border-slate-200 ' + (parcelSelected ? 'opacity-50' : '') + ' ' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '">' +
+      '<label class="block text-sm font-bold text-gray-700 mb-3 flex items-center gap-2">' +
+      '<span class="bg-slate-200 w-5 h-5 rounded-full flex items-center justify-center text-xs text-slate-600 font-bold">3</span> 是否需堆高機？ <span class="text-red-500">*</span>' +
+      (parcelSelected ? '<span class="text-xs font-normal text-gray-500">(包裹類預設不需要)</span>' : '') + '</label>' +
+      '<div class="flex gap-6">' +
+      [{ v: 'yes', l: '是，需要堆高機' }, { v: 'no', l: '否，不需堆高機' }].map(function (opt) {
+        return '<label class="flex items-center gap-2 cursor-pointer group ' + (parcelSelected ? 'cursor-not-allowed' : '') + '">' +
+          '<input type="radio" name="urgent-forklift" value="' + opt.v + '" data-onchange="forklift" ' + (parcelSelected ? 'disabled' : '') + ' ' + (f.needForklift === opt.v ? 'checked' : '') + ' class="w-4 h-4 text-amber-600 focus:ring-amber-500 border-gray-300 cursor-pointer disabled:cursor-not-allowed" />' +
+          '<span class="group-hover:text-amber-600 transition-colors ' + (parcelSelected ? 'text-gray-400 group-hover:text-gray-400' : '') + '">' + opt.l + '</span></label>'
+      }).join('') + '</div></div>' +
+
+      '<div class="grid grid-cols-1 md:grid-cols-2 gap-6 ' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '">' +
+      '<div><label class="block text-sm font-bold text-gray-700 mb-2">4. 預約日期 <span class="text-red-500">*</span></label>' +
+      '<div class="relative"><i data-lucide="calendar" class="absolute left-3 top-3 h-5 w-5 text-gray-400"></i>' +
+      '<input type="date" ' + (gateOk ? 'required' : 'disabled') + ' lang="en" min="' + GLOBAL.config.minDate + '" max="' + GLOBAL.config.maxDate + '" data-onchange="date" value="' + f.date + '" ' +
+      'class="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition bg-white" /></div>' +
+      '<div id="urgent-date-messages"></div></div>' +
+
+      '<div><label class="block text-sm font-bold text-gray-700 mb-2">5. 預約時段 <span class="text-red-500">*</span></label>' +
+      '<div class="relative" id="urgent-time-select-box"></div></div>' +
+      '</div>' +
+
+      (parcelSelected ? '<div class="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-900 animate-fade-in flex gap-3">' +
+        '<i data-lucide="package-x" class="h-5 w-5 text-amber-600 shrink-0 mt-0.5"></i><div><h4 class="font-bold mb-1">包裹/貨運 注意事項</h4>' +
+        '<p>交貨日期請填寫<strong>「貨運到達日期」</strong>，<span class="text-red-600 font-bold">而非</span>寄貨當日日期。</p></div></div>' : '') +
+
+      '<div class="pt-4 ' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '">' +
+      '<div class="flex items-center gap-3 mb-4 p-3 bg-amber-50 rounded-lg border border-amber-100">' +
+      '<input id="urgent-agreement" type="checkbox" ' + (gateOk ? 'required' : 'disabled') + ' data-onchange="agree" ' + (f.agreedToRules ? 'checked' : '') + ' class="w-5 h-5 text-amber-600 rounded border-gray-300 focus:ring-amber-500 cursor-pointer" />' +
+      '<label for="urgent-agreement" class="text-sm font-medium text-gray-700 cursor-pointer select-none">我已確認此為急件臨時追加預約，並已詳細閱讀並同意上述所有預約規定</label></div>' +
+      '<button type="submit" ' + (!gateOk || s.submitting ? 'disabled' : '') + ' class="w-full bg-amber-600 hover:bg-amber-700 text-white font-bold py-4 px-6 rounded-xl transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg flex justify-center items-center gap-2 text-lg">' +
+      (s.submitting ? '系統處理中...' : '確認送出急件預約 <i data-lucide="zap" class="h-5 w-5"></i>') +
+      '</button></div>' +
+      '</form></div></div>'
+  },
+
+  // 只重繪「時段選單 + 日期訊息」，避免整表重繪打斷使用者在其他欄位的輸入
+  renderAvailability: function () {
+    var box = qs('#urgent-time-select-box')
+    var msgBox = qs('#urgent-date-messages')
+    if (!box) return
+    var f = ub.state.form
+    var s = ub.state
+    var parcelSelected = f.locations.indexOf(PARCEL_LOCATION) >= 0
+    var visibleSlots = TIME_SLOTS.filter(function (slot) { return parcelSelected ? slot === PARCEL_ONLY_SLOT : slot !== PARCEL_ONLY_SLOT })
+    var result = ub.currentAvailability()
+    var disabledSelect = !s.purchaserVerified || !f.date || f.locations.length === 0 || parcelSelected || result.dayBlocked
+    var placeholder = !s.purchaserVerified ? '請先完成採購員驗證' : (!f.date ? '請先選擇預約日期' : (f.locations.length === 0 ? '請先選擇交貨地點' : (result.dayBlocked ? (result.messages[0] || '此日期暫停預約') : (parcelSelected ? '已自動鎖定包裹專用時段' : '請選擇時段'))))
+
+    box.innerHTML = '' +
+      '<i data-lucide="clock" class="absolute left-3 top-3 h-5 w-5 text-gray-400 z-10"></i>' +
+      '<select ' + (disabledSelect ? 'disabled' : '') + ' data-onchange="time" class="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition appearance-none ' +
+      (disabledSelect ? 'bg-gray-100 text-gray-500 cursor-not-allowed' : 'bg-white') + '">' +
+      '<option value="">' + placeholder + '</option>' +
+      visibleSlots.map(function (slot) {
+        var a = result.availability[slot]
+        if (!a) return ''
+        var selectable = ub.slotSelectable(a)
+        var label = slot
+        if (!parcelSelected) {
+          if (a.available) label += ' (餘 ' + a.remaining + ')'
+          else if (a.reason === '已額滿') label += ' (已額滿，急件可略過)'
+        }
+        return '<option value="' + slot + '" ' + (!selectable ? 'disabled' : '') + ' ' + (f.time === slot ? 'selected' : '') + '>' + label + '</option>'
+      }).join('') +
+      '</select><i data-lucide="chevron-down" class="absolute right-3 top-3.5 h-4 w-4 text-gray-500 pointer-events-none"></i>'
+
+    if (msgBox) {
+      msgBox.innerHTML = result.messages.length ? '' +
+        '<div class="mt-2 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-100 space-y-1 animate-fade-in">' +
+        result.messages.map(function (m) { return '<div class="flex items-start gap-2"><i data-lucide="alert-triangle" class="h-4 w-4 shrink-0 mt-0.5"></i><span>' + esc(m) + '</span></div>' }).join('') +
+        '</div>' : ''
+    }
+    refreshIcons()
+  },
+
+  updateSuggestions: function () {
+    var val = ub.state.form.supplierName
+    var box = qs('#urgent-supplier-suggestions')
+    if (!box) return
+    if (!val) { box.classList.add('hidden'); box.innerHTML = ''; return }
+    var list = GLOBAL.suppliers.filter(function (s) {
+      return (s.name && s.name.toLowerCase().indexOf(val.toLowerCase()) >= 0) || (s.masterId && s.masterId.indexOf(val) >= 0)
+    }).slice(0, 10)
+    if (list.length === 0) { box.classList.add('hidden'); box.innerHTML = ''; return }
+    box.classList.remove('hidden')
+    box.innerHTML = list.map(function (s) {
+      return '<li data-action="pick-supplier" data-name="' + esc(s.name || '') + '" class="px-4 py-2 hover:bg-amber-50 cursor-pointer text-sm text-gray-700 border-b border-gray-50 last:border-0 flex justify-between">' +
+        '<span>' + esc(s.name) + '</span>' + (s.masterId ? '<span class="text-gray-400 text-xs">' + esc(s.masterId) + '</span>' : '') + '</li>'
+    }).join('')
+  },
+
+  toggleLocation: function (name) {
+    if (!ub.state.purchaserVerified) return
+    var f = ub.state.form
+    var locations = f.locations.slice()
+    var time = f.time, needForklift = f.needForklift, notice = ''
+    if (name === PARCEL_LOCATION) {
+      if (locations.indexOf(PARCEL_LOCATION) >= 0) {
+        locations = locations.filter(function (l) { return l !== PARCEL_LOCATION })
+        if (time === PARCEL_ONLY_SLOT) time = ''
+      } else {
+        if (locations.length > 0) notice = '已自動取消原本選擇的地點（' + locations.join('、') + '），包裹類只能單選'
+        locations = [PARCEL_LOCATION]
+        time = PARCEL_ONLY_SLOT
+        needForklift = 'no'
+      }
+    } else if (locations.indexOf(PARCEL_LOCATION) >= 0) {
+      notice = '已自動取消包裹類，改為您剛選擇的地點'
+      locations = [name]
+      if (time === PARCEL_ONLY_SLOT) time = ''
+    } else if (locations.indexOf(name) >= 0) {
+      locations = locations.filter(function (l) { return l !== name })
+    } else {
+      locations.push(name)
+    }
+    f.locations = locations; f.time = time; f.needForklift = needForklift
+    ub.state.locationNotice = notice
+    ub.render()
+    ub.refreshSlotCounts()
+    if (notice) setTimeout(function () { ub.state.locationNotice = ''; ub.render() }, 4000)
+  },
+
+  // 選擇的採購員或輸入的分機異動時，先重置驗證狀態，避免使用者改了選項卻沿用舊的「已驗證」畫面，
+  // 之後 debounce 一小段時間再自動重新驗證（不用額外按按鈕，輸對就會自動解鎖）
+  resetVerification: function () {
+    ub.state.purchaserVerified = false
+    ub.state.verifyError = ''
+  },
+
+  scheduleVerify: function () {
+    if (ub.verifyTimer) clearTimeout(ub.verifyTimer)
+    var f = ub.state.form
+    if (!f.purchaserId || !f.purchaserExt) { ub.render(); return }
+    ub.verifyTimer = setTimeout(function () { ub.doVerify() }, 400)
+    ub.render()
+  },
+
+  doVerify: function () {
+    var f = ub.state.form
+    if (!f.purchaserId || !f.purchaserExt) return
+    ub.state.verifying = true
+    ub.render()
+    api('verifyPurchaser', { purchaserId: f.purchaserId, extension: f.purchaserExt }).then(function (data) {
+      ub.state.verifying = false
+      if (ub.state.form.purchaserId !== f.purchaserId || ub.state.form.purchaserExt !== f.purchaserExt) return // 驗證期間使用者又改了輸入，這個結果已經過期
+      ub.state.purchaserVerified = !!data.valid
+      ub.state.verifyError = data.valid ? '' : '分機號碼不正確，請重新確認'
+      ub.render()
+    }).catch(function () {
+      ub.state.verifying = false
+      ub.state.verifyError = '驗證失敗，請重試'
+      ub.render()
+    })
+  },
+
+  onClick: function (action, target) {
+    if (action === 'toggle-location') { ub.toggleLocation(target.getAttribute('data-name')); return }
+    if (action === 'pick-supplier') {
+      ub.state.form.supplierName = target.getAttribute('data-name')
+      var sug = qs('#urgent-supplier-suggestions'); if (sug) sug.classList.add('hidden')
+      var inp = qs('input[data-oninput="supplier"]'); if (inp) inp.value = ub.state.form.supplierName
+      return
+    }
+    if (action === 'reset') { ub.resetForm(); ub.render(); ub.refreshSlotCounts(); return }
+  },
+
+  onChange: function (action, target) {
+    var f = ub.state.form
+    if (action === 'purchaser-select') { f.purchaserId = target.value; ub.resetVerification(); ub.scheduleVerify(); return }
+    if (action === 'date') { f.date = target.value; f.time = ''; ub.render(); ub.refreshSlotCounts(); return }
+    if (action === 'time') { f.time = target.value; return }
+    if (action === 'forklift') { f.needForklift = target.value; return }
+    if (action === 'agree') { f.agreedToRules = target.checked; return }
+  },
+
+  onInput: function (action, target) {
+    if (action === 'purchaser-ext') { ub.state.form.purchaserExt = target.value; ub.resetVerification(); ub.scheduleVerify(); return }
+    if (action === 'supplier') { ub.state.form.supplierName = target.value; ub.updateSuggestions(); return }
+    if (action === 'email') { ub.state.form.email = target.value; return }
+  },
+
+  onOutsideMousedown: function (e) {
+    var box = qs('#urgent-supplier-box')
+    if (box && !box.contains(e.target)) { var sug = qs('#urgent-supplier-suggestions'); if (sug) sug.classList.add('hidden') }
+  },
+
+  onSubmit: function (action) {
+    if (action !== 'urgent-book') return
+    var f = ub.state.form
+    var s = ub.state
+    s.error = ''
+    var problems = []
+    if (!s.purchaserVerified) problems.push('請先完成對應採購員的分機驗證')
+    if (f.locations.length === 0) problems.push('請選擇交貨地點')
+    if (!f.time) problems.push('請選擇時段')
+    var avail = ub.currentAvailability()
+    if (f.time && !ub.slotSelectable(avail.availability[f.time])) problems.push('所選時段暫停預約（急件也無法預約）')
+    if (!f.agreedToRules) problems.push('請勾選同意預約規定')
+    if (problems.length > 0) { s.error = problems.join('；'); ub.render(); return }
+
+    s.submitting = true
+    ub.render()
+    api('createUrgentBooking', {
+      supplierName: f.supplierName, email: f.email, locations: f.locations, date: f.date, time: f.time, needForklift: f.needForklift,
+      purchaserId: f.purchaserId, purchaserExt: f.purchaserExt,
+    }).then(function (data) {
+      s.submitting = false
+      s.bookingCode = data.bookingCode
+      ub.render()
+    }).catch(function (err) {
+      s.submitting = false
+      s.error = err.message === 'SLOT_FULL' ? '所選時段已在您送出的同時被搶先預約，請重新選擇時段' : (err.message || '預約失敗，請重試')
+      ub.render()
+      ub.refreshSlotCounts()
+    })
+  },
+}
+
+/* ============================================================
  * 收貨站管理（對應原本 AdminPanel.jsx）
  * ============================================================ */
 function pastDaysStr(days) { var d = new Date(); d.setDate(d.getDate() - days); return formatDateObj(d) }
@@ -1038,6 +1418,7 @@ var ap = {
     if (ap.state.view === 'rules') rm.mount(sub)
     else if (ap.state.view === 'suppliers') sm.mount(sub)
     else if (ap.state.view === 'announcements') an.mount(sub)
+    else if (ap.state.view === 'purchasers') pum.mount(sub)
     else ap.renderListView(sub)
   },
 
@@ -1068,7 +1449,7 @@ var ap = {
       (s.view === 'list' ? '<p class="text-sm text-gray-500 mt-1 font-medium">' + esc(rangeLabel) + '</p>' : '') + '</div>' +
       '<div class="flex flex-wrap gap-3 w-full xl:w-auto items-center">' +
       '<div class="flex bg-slate-100 p-1.5 rounded-xl overflow-x-auto">' +
-      ['list:預約列表', 'rules:規則設定', 'suppliers:供應商', 'announcements:公告設定'].map(function (pair) {
+      ['list:預約列表', 'rules:規則設定', 'suppliers:供應商', 'purchasers:採購員管理', 'announcements:公告設定'].map(function (pair) {
         var parts = pair.split(':'); var v = parts[0], label = parts[1]
         return '<button data-action="set-view" data-view="' + v + '" class="px-4 py-2 rounded-lg text-sm font-bold whitespace-nowrap transition-all ' + (s.view === v ? 'bg-white shadow text-blue-600' : 'text-slate-500 hover:text-slate-700') + '">' + label + '</button>'
       }).join('') +
@@ -1308,11 +1689,14 @@ var ap = {
           return '<th class="px-6 py-4 text-' + (i === 5 ? 'center' : 'left') + ' text-xs font-bold text-gray-500 uppercase tracking-wider">' + h + '</th>'
         }).join('') + '</tr></thead><tbody class="bg-white divide-y divide-gray-100">' +
         active.map(function (b) {
-          return '<tr id="booking-row-' + b.id + '" class="hover:bg-blue-50/50 transition-colors group ' + (b.status === 'completed' ? 'bg-gray-50 opacity-60 grayscale' : '') + ' ' + (s.highlightId === b.id ? 'bg-yellow-100 ring-2 ring-yellow-400' : '') + '">' +
+          return '<tr id="booking-row-' + b.id + '" class="hover:bg-blue-50/50 transition-colors group ' + (b.status === 'completed' ? 'bg-gray-50 opacity-60 grayscale' : (b.isUrgent ? 'bg-amber-50/40' : '')) + ' ' + (s.highlightId === b.id ? 'bg-yellow-100 ring-2 ring-yellow-400' : '') + '">' +
             '<td class="px-6 py-4 whitespace-nowrap"><div class="text-sm font-bold text-gray-800">' + esc(displayDate(b.date)) + '</div><div class="text-sm text-blue-600 font-bold">' + esc(b.time) + '</div></td>' +
             '<td class="px-6 py-4 whitespace-nowrap"><div class="text-xs font-mono text-purple-600 font-bold bg-purple-50 px-2.5 py-1 rounded-lg inline-block border border-purple-100">' + esc(b.bookingCode) + '</div></td>' +
             '<td class="px-6 py-4 whitespace-nowrap"><div class="text-sm text-gray-700 truncate max-w-[120px]" title="' + esc(b.location) + '">' + esc(b.location || '未指定') + '</div></td>' +
-            '<td class="px-6 py-4 whitespace-nowrap"><div class="text-sm text-gray-900 font-bold">' + esc(b.supplierName) + '</div></td>' +
+            '<td class="px-6 py-4 whitespace-nowrap"><div class="text-sm text-gray-900 font-bold flex items-center gap-1.5 flex-wrap">' + esc(b.supplierName) +
+            (b.isUrgent ? '<span class="inline-flex items-center gap-0.5 text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200"><i data-lucide="zap" class="h-2.5 w-2.5"></i> 急件</span>' : '') + '</div>' +
+            (b.isUrgent ? '<div class="text-[10px] text-amber-600 mt-0.5">採購員：' + esc(b.purchaserName || '') + (b.purchaserExt ? '（分機 ' + esc(b.purchaserExt) + '）' : '') + '</div>' : '') +
+            '</td>' +
             '<td class="px-6 py-4 whitespace-nowrap"><div class="text-xs text-gray-500 mb-1 font-mono">' + esc(b.email) + '</div>' +
             (b.needForklift === 'yes' ? '<span class="text-[10px] font-bold text-orange-600 bg-orange-100 px-2 py-0.5 rounded border border-orange-200">需堆高機</span>' : '') + '</td>' +
             '<td class="px-6 py-4 whitespace-nowrap text-center">' +
@@ -1377,6 +1761,7 @@ var ap = {
     if (ap.state.view === 'rules' && rm.onSubmit) return rm.onSubmit(action, form)
     if (ap.state.view === 'suppliers' && sm.onSubmit) return sm.onSubmit(action, form)
     if (ap.state.view === 'announcements' && an.onSubmit) return an.onSubmit(action, form)
+    if (ap.state.view === 'purchasers' && pum.onSubmit) return pum.onSubmit(action, form)
   },
 
   onInput: function (action, target) {
@@ -1388,6 +1773,7 @@ var ap = {
     if (ap.state.view === 'rules' && rm.onInput) return rm.onInput(action, target)
     if (ap.state.view === 'suppliers' && sm.onInput) return sm.onInput(action, target)
     if (ap.state.view === 'announcements' && an.onInput) return an.onInput(action, target)
+    if (ap.state.view === 'purchasers' && pum.onInput) return pum.onInput(action, target)
   },
 
   onChange: function (action, target) {
@@ -1410,6 +1796,7 @@ var ap = {
     if (ap.state.view === 'rules' && rm.onChange) return rm.onChange(action, target)
     if (ap.state.view === 'suppliers' && sm.onChange) return sm.onChange(action, target)
     if (ap.state.view === 'announcements' && an.onChange) return an.onChange(action, target)
+    if (ap.state.view === 'purchasers' && pum.onChange) return pum.onChange(action, target)
   },
 
   onClick: function (action, target) {
@@ -1467,6 +1854,7 @@ var ap = {
     if (ap.state.view === 'rules' && rm.onClick) return rm.onClick(action, target)
     if (ap.state.view === 'suppliers' && sm.onClick) return sm.onClick(action, target)
     if (ap.state.view === 'announcements' && an.onClick) return an.onClick(action, target)
+    if (ap.state.view === 'purchasers' && pum.onClick) return pum.onClick(action, target)
   },
 
   // 匯出「廠商交貨清單」：依日期分組，同一天內「同時段 + 同交貨類型 + 同堆高機需求」的多家廠商合併成同一列
@@ -2339,6 +2727,157 @@ var an = {
       s.submitting = false
       if (!an.authGuard(err)) alert((s.editingId ? '更新' : '新增') + '失敗: ' + (err.message || ''))
       an.render()
+    })
+  },
+}
+
+/* ============================================================
+ * 採購員名單管理（後台維護「急件預約」要選的對應採購員清單，姓名+分機；
+ * 分機屬於驗證用的機密資訊，後台這裡才看得到 —— 對外的 bootstrap 只會回傳姓名，見 GLOBAL.purchasers）
+ * ============================================================ */
+var pum = {
+  host: null,
+  state: {
+    list: [], loading: false, form: { name: '', extension: '' }, editingId: null,
+    submitting: false, deletingId: null,
+  },
+
+  mount: function (host) {
+    pum.host = host
+    pum.state.editingId = null
+    pum.state.form = { name: '', extension: '' }
+    pum.render()
+    pum.reload()
+  },
+
+  authGuard: function (err) { if (ap.isAuthErr(err)) { ap.forceLogout('登入已逾期，請重新登入'); return true } return false },
+
+  reload: function () {
+    pum.state.loading = true
+    pum.render()
+    api('adminListPurchasers', { token: ap.state.token }).then(function (data) {
+      pum.state.list = data.purchasers || []
+      pum.state.loading = false
+      pum.render()
+    }).catch(function (err) {
+      pum.state.loading = false
+      if (!pum.authGuard(err)) alert('讀取採購員名單失敗')
+      pum.render()
+    })
+  },
+
+  // 後台新增/修改/刪除採購員後，順便同步一份給「急件預約」頁用的 GLOBAL.purchasers（前端只看得到姓名）
+  syncGlobal: function () { loadBootstrap().catch(function () {}) },
+
+  render: function () {
+    if (!pum.host) return
+    var s = pum.state
+    var f = s.form
+    pum.host.innerHTML = '' +
+      '<div class="bg-white rounded-xl p-6 border border-gray-200 shadow-sm mt-4">' +
+      '<div class="flex justify-between items-center mb-2"><h3 class="text-lg font-bold text-gray-800 flex items-center gap-2"><i data-lucide="user-cog" class="h-5 w-5"></i> 採購員管理</h3></div>' +
+      '<p class="text-xs text-gray-500 mb-6">在這裡維護的採購員名單，會出現在供應商「急件預約」頁的對應採購員選單。分機號碼僅用於供應商送出急件預約前的身分驗證，不會顯示在對外頁面。</p>' +
+
+      '<div class="bg-slate-50 p-5 rounded-xl border border-slate-200 mb-8">' +
+      '<label class="block text-xs font-bold text-gray-500 mb-3">' + (s.editingId ? '編輯採購員資料' : '新增採購員') + '</label>' +
+      '<div class="flex flex-col sm:flex-row gap-3"><div class="flex-1 grid grid-cols-2 gap-3">' +
+      '<input type="text" data-oninput="pum-name" value="' + esc(f.name) + '" class="px-4 py-2 border border-gray-300 rounded-lg outline-none focus:ring-2 focus:ring-slate-500" placeholder="採購員姓名 (必填)" />' +
+      '<input type="text" data-oninput="pum-ext" value="' + esc(f.extension) + '" class="px-4 py-2 border border-gray-300 rounded-lg outline-none focus:ring-2 focus:ring-slate-500" placeholder="分機號碼 (必填)" />' +
+      '</div><div class="flex gap-2">' +
+      (s.editingId ? '<button data-action="pum-cancel-edit" class="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-bold whitespace-nowrap">取消編輯</button>' : '') +
+      '<button data-action="pum-submit" ' + (s.submitting ? 'disabled' : '') + ' class="px-6 py-2 bg-slate-800 text-white rounded-lg hover:bg-slate-900 transition disabled:opacity-50 font-medium whitespace-nowrap">' +
+      (s.submitting ? '處理中...' : (s.editingId ? '儲存修改' : '新增')) + '</button>' +
+      '</div></div></div>' +
+
+      '<div id="purchaser-list-area"></div></div>'
+    refreshIcons()
+    pum.renderList()
+  },
+
+  renderList: function () {
+    var area = qs('#purchaser-list-area')
+    if (!area) return
+    var s = pum.state
+    if (s.loading && s.list.length === 0) { area.innerHTML = '<div class="text-center py-10 text-gray-400">資料載入中...</div>'; refreshIcons(); return }
+    if (s.list.length === 0) { area.innerHTML = '<div class="text-center py-10 bg-gray-50 rounded-xl border-2 border-dashed border-gray-200 text-gray-500 font-medium">目前沒有任何採購員資料，請先新增</div>'; refreshIcons(); return }
+    area.innerHTML = '' +
+      '<div class="border border-gray-200 rounded-lg overflow-x-auto"><table class="min-w-full divide-y divide-gray-200">' +
+      '<thead class="bg-gray-50"><tr>' +
+      '<th class="px-6 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wider">姓名</th>' +
+      '<th class="px-6 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-32">分機</th>' +
+      '<th class="px-6 py-3 text-left text-xs font-bold text-gray-500 uppercase tracking-wider w-40">建立時間</th>' +
+      '<th class="px-6 py-3 text-right text-xs font-bold text-gray-500 uppercase tracking-wider w-24">操作</th></tr></thead>' +
+      '<tbody class="bg-white divide-y divide-gray-200">' +
+      s.list.map(function (p) {
+        return '<tr class="hover:bg-slate-50 transition">' +
+          '<td class="px-6 py-3 whitespace-nowrap text-sm font-medium text-gray-900">' + esc(p.name) + '</td>' +
+          '<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-500 font-mono">' + esc(p.extension || '-') + '</td>' +
+          '<td class="px-6 py-3 whitespace-nowrap text-sm text-gray-400">' + formatTimestamp(p.createdAt) + '</td>' +
+          '<td class="px-6 py-3 whitespace-nowrap text-right text-sm font-medium">' +
+          '<button data-action="pum-edit" data-id="' + p.id + '" title="編輯" class="text-gray-400 hover:text-amber-600 transition p-1"><i data-lucide="pencil" class="h-4 w-4"></i></button>' +
+          '<button data-action="pum-delete" data-id="' + p.id + '" ' + (s.deletingId === p.id ? 'disabled' : '') + ' title="刪除" class="text-red-400 hover:text-red-600 transition p-1"><i data-lucide="trash-2" class="h-4 w-4"></i></button>' +
+          '</td></tr>'
+      }).join('') +
+      '</tbody></table></div>'
+    refreshIcons()
+  },
+
+  onInput: function (action, target) {
+    if (action === 'pum-name') { pum.state.form.name = target.value; return }
+    if (action === 'pum-ext') { pum.state.form.extension = target.value; return }
+  },
+
+  onClick: function (action, target) {
+    var s = pum.state
+    if (action === 'pum-submit') { pum.handleSubmit(); return }
+    if (action === 'pum-cancel-edit') { s.editingId = null; s.form = { name: '', extension: '' }; pum.render(); return }
+    if (action === 'pum-edit') {
+      var id = target.getAttribute('data-id')
+      var item = s.list.filter(function (p) { return p.id === id })[0]
+      if (!item) return
+      s.editingId = id
+      s.form = { name: item.name, extension: item.extension || '' }
+      pum.render()
+      return
+    }
+    if (action === 'pum-delete') {
+      if (!window.confirm('確定刪除此採購員？刪除後，供應商將無法再於急件預約選擇此人。')) return
+      var did = target.getAttribute('data-id')
+      s.deletingId = did
+      pum.renderList()
+      api('deletePurchaser', { token: ap.state.token, id: did }).then(function () {
+        s.deletingId = null
+        pum.syncGlobal()
+        pum.reload()
+      }).catch(function (err) {
+        s.deletingId = null
+        if (!pum.authGuard(err)) alert('刪除失敗')
+        pum.renderList()
+      })
+      return
+    }
+  },
+
+  handleSubmit: function () {
+    var s = pum.state
+    var f = s.form
+    if (!f.name.trim()) { alert('請輸入採購員姓名'); return }
+    if (!f.extension.trim()) { alert('請輸入分機號碼'); return }
+    s.submitting = true
+    pum.render()
+    var req = s.editingId
+      ? api('updatePurchaser', { token: ap.state.token, id: s.editingId, name: f.name, extension: f.extension })
+      : api('addPurchaser', { token: ap.state.token, name: f.name, extension: f.extension })
+    req.then(function () {
+      s.submitting = false
+      s.editingId = null
+      s.form = { name: '', extension: '' }
+      pum.syncGlobal()
+      pum.reload()
+    }).catch(function (err) {
+      s.submitting = false
+      if (!pum.authGuard(err)) alert((s.editingId ? '更新' : '新增') + '失敗: ' + (err.message || ''))
+      pum.render()
     })
   },
 }
