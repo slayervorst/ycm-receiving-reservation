@@ -665,7 +665,7 @@ var bf = {
     if (!GLOBAL.loaded) loadBootstrap().then(bf.render).catch(function (e) { console.error(e) })
     bf.refreshSlotCounts()
     if (bf.pollTimer) clearInterval(bf.pollTimer)
-    bf.pollTimer = setInterval(function () { if (appState.activeTab === 'book') { bf.refreshSlotCounts(); refreshAnnouncements(bf.render) } }, 15000)
+    bf.pollTimer = setInterval(function () { if (appState.activeTab === 'book') { bf.refreshSlotCounts(); refreshAnnouncements(bf.render) } }, 120000)
   },
 
   resetForm: function (keepNothing) {
@@ -989,7 +989,7 @@ var ap = {
       ap.state.view = 'list'
       ap.render()
       ap.loadBookings()
-      ap.pollTimer = setInterval(function () { if (appState.activeTab === 'schedule' && ap.state.view === 'list') ap.loadBookings() }, 20000)
+      ap.pollTimer = setInterval(function () { if (appState.activeTab === 'schedule' && ap.state.view === 'list') ap.loadBookings() }, 600000)
     } else {
       ap.render()
     }
@@ -1254,6 +1254,8 @@ var ap = {
         '</div>' : '') +
       '<p class="text-xs text-gray-400 w-full basis-full">此區間僅決定「預約列表」跟「搜尋」顯示的資料範圍，不代表僅有此範圍內有預約</p></div>' +
       '<div class="flex gap-2 flex-wrap justify-end">' +
+      '<button data-action="refresh-list" ' + (s.loadingList ? 'disabled' : '') + ' class="flex items-center gap-2 px-4 py-2.5 bg-white hover:bg-gray-50 text-gray-700 text-sm font-bold rounded-xl transition shadow-md border border-gray-300 ' + (s.loadingList ? 'opacity-70 cursor-wait' : '') + '" title="立即重新讀取最新的預約資料">' +
+      '<i data-lucide="refresh-cw" class="h-4 w-4' + (s.loadingList ? ' animate-spin' : '') + '"></i> ' + (s.loadingList ? '刷新中...' : '立即刷新') + '</button>' +
       '<button data-action="open-noon" class="flex items-center gap-2 px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white text-sm font-bold rounded-xl transition shadow-md" title="列出今天早上 07:45 出單後才新增或改到「今天下午」時段的預約">' +
       '<i data-lucide="sun" class="h-4 w-4"></i> 中午新增預約</button>' +
       '<button data-action="export" ' + (s.exporting ? 'disabled' : '') + ' class="flex items-center gap-2 px-4 py-2.5 bg-green-600 hover:bg-green-700 text-white text-sm font-bold rounded-xl transition shadow-md ' + (s.exporting ? 'opacity-70 cursor-wait' : '') + '">' +
@@ -1412,6 +1414,7 @@ var ap = {
     }
     if (action === 'logout') { ap.forceLogout(''); return }
     if (action === 'export') { ap.handleExport(); return }
+    if (action === 'refresh-list') { ap.loadBookings(); return }
     if (action === 'open-noon') { s.showNoonModal = true; s.noonBookings = []; ap.loadNoonBookings(); return }
     if (action === 'close-noon' || action === 'close-noon-backdrop') { s.showNoonModal = false; ap.render(); return }
     if (action === 'noon-refresh') { ap.loadNoonBookings(); return }
