@@ -981,7 +981,6 @@ var bf = {
  * ============================================================ */
 var ub = {
   host: null,
-  verifyTimer: null,
   state: {
     form: { purchaserId: '', purchaserExt: '', supplierName: '', email: '', locations: [], date: todayStr(), time: '', needForklift: 'no', agreedToRules: false },
     purchaserVerified: false, verifying: false, verifyError: '',
@@ -1100,7 +1099,7 @@ var ub = {
       '</label>' +
       '<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">' +
       '<select data-onchange="purchaser-select" class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none bg-white">' + purchaserOptions + '</select>' +
-      '<input type="text" inputmode="numeric" placeholder="輸入對應分機號碼" data-oninput="purchaser-ext" value="' + esc(f.purchaserExt) + '" ' +
+      '<input type="text" inputmode="numeric" placeholder="輸入對應分機號碼，完成後按 Enter 或點別處即可驗證" data-oninput="purchaser-ext" data-onchange="purchaser-ext" value="' + esc(f.purchaserExt) + '" ' +
       'class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none" />' +
       '</div>' +
       (s.verifying ? '<p class="mt-2 text-xs text-gray-400">驗證中...</p>' : '') +
@@ -1250,24 +1249,18 @@ var ub = {
     if (notice) setTimeout(function () { ub.state.locationNotice = ''; ub.render() }, 4000)
   },
 
-  // 選擇的採購員或輸入的分機異動時，先重置驗證狀態，避免使用者改了選項卻沿用舊的「已驗證」畫面，
-  // 之後 debounce 一小段時間再自動重新驗證（不用額外按按鈕，輸對就會自動解鎖）
+  // 選擇的採購員或輸入的分機異動時，先重置驗證狀態，避免使用者改了選項卻沿用舊的「已驗證」畫面。
+  // 注意：這裡不會主動重繪畫面（render），因為分機欄位在使用者「還在輸入中」時（data-oninput）
+  // 只會呼叫 resetVerification 本身、不會呼叫這裡——真正觸發重新驗證是等使用者「打完離開欄位」
+  // 才會用 data-onchange 呼叫 doVerify()，避免每打一個字就整個表單重繪一次、導致輸入到一半就掉焦點。
   resetVerification: function () {
     ub.state.purchaserVerified = false
     ub.state.verifyError = ''
   },
 
-  scheduleVerify: function () {
-    if (ub.verifyTimer) clearTimeout(ub.verifyTimer)
-    var f = ub.state.form
-    if (!f.purchaserId || !f.purchaserExt) { ub.render(); return }
-    ub.verifyTimer = setTimeout(function () { ub.doVerify() }, 400)
-    ub.render()
-  },
-
   doVerify: function () {
     var f = ub.state.form
-    if (!f.purchaserId || !f.purchaserExt) return
+    if (!f.purchaserId || !f.purchaserExt) { ub.render(); return }
     ub.state.verifying = true
     ub.render()
     api('verifyPurchaser', { purchaserId: f.purchaserId, extension: f.purchaserExt }).then(function (data) {
@@ -1296,7 +1289,11 @@ var ub = {
 
   onChange: function (action, target) {
     var f = ub.state.form
-    if (action === 'purchaser-select') { f.purchaserId = target.value; ub.resetVerification(); ub.scheduleVerify(); return }
+    // 下拉選單一次選定就是完整的一次操作（不像打字逐字觸發），選好就可以直接驗證
+    if (action === 'purchaser-select') { f.purchaserId = target.value; ub.resetVerification(); ub.doVerify(); return }
+    // 分機欄位：使用者打完整串分機、離開欄位（blur）時瀏覽器才會觸發 change，這時才真正呼叫驗證 API
+    // 並重繪畫面；打字過程中（data-oninput）只會更新內部狀態，不會呼叫這裡，避免每打一個字就重繪一次
+    if (action === 'purchaser-ext') { f.purchaserExt = target.value; ub.resetVerification(); ub.doVerify(); return }
     if (action === 'date') { f.date = target.value; f.time = ''; ub.render(); ub.refreshSlotCounts(); return }
     if (action === 'time') { f.time = target.value; return }
     if (action === 'forklift') { f.needForklift = target.value; return }
@@ -1304,7 +1301,9 @@ var ub = {
   },
 
   onInput: function (action, target) {
-    if (action === 'purchaser-ext') { ub.state.form.purchaserExt = target.value; ub.resetVerification(); ub.scheduleVerify(); return }
+    // 分機欄位：輸入過程中只更新內部狀態（不重繪、不驗證），避免打字打到一半整個表單重建、輸入框掉焦點；
+    // 真正的驗證要等使用者打完離開欄位（見上面 onChange 的 'purchaser-ext'）
+    if (action === 'purchaser-ext') { ub.state.form.purchaserExt = target.value; return }
     if (action === 'supplier') { ub.state.form.supplierName = target.value; ub.updateSuggestions(); return }
     if (action === 'email') { ub.state.form.email = target.value; return }
   },
