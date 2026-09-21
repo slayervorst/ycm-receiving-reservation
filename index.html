@@ -981,6 +981,7 @@ var bf = {
  * ============================================================ */
 var ub = {
   host: null,
+  pollTimer: null,
   state: {
     form: { purchaserId: '', purchaserExt: '', supplierName: '', email: '', locations: [], date: todayStr(), time: '', needForklift: 'no', agreedToRules: false },
     purchaserVerified: false, verifying: false, verifyError: '',
@@ -995,6 +996,10 @@ var ub = {
     ub.render()
     if (!GLOBAL.loaded) loadBootstrap().then(ub.render).catch(function (e) { console.error(e) })
     ub.refreshSlotCounts()
+    if (ub.pollTimer) clearInterval(ub.pollTimer)
+    // 定期重繪時段選單：因為「已過時段」是跟著現在時間走的，頁面開著不動時也要讓已經過去的
+    // 時段自動變灰、選不到，不用等使用者手動做其他操作才會重新計算
+    ub.pollTimer = setInterval(function () { if (appState.activeTab === 'urgent') { ub.refreshSlotCounts(); refreshAnnouncements(ub.render) } }, 60000)
   },
 
   resetForm: function () {
@@ -1023,9 +1028,24 @@ var ub = {
     return computeAvailability({ date: ub.state.form.date, locations: ub.state.form.locations, rules: GLOBAL.rules, slotCounts: ub.state.slotCounts, includeCutoff: false })
   },
 
-  // 急件可選的時段：本來就可預約，或唯一被擋的原因剛好是「已額滿」（急件可以突破名額）
-  slotSelectable: function (a) {
-    return !!a && (a.available || a.reason === '已額滿')
+  // 急件時段是否「已經結束」（現在時間已超過該時段的結束時間）。時段字串（如「下午13:00~14:00」）
+  // 的結束時間本來就是 24 小時制數字，直接抓「~」後面那段即可。這跟出單時間鎖定不一樣：
+  // 急件可以略過出單時間鎖定，但不能訂一個已經過去的時段——這是真正的物理時間限制，
+  // 真正把關一律在 Code.gs 的 actionCreateUrgentBooking_（slotAlreadyPassed_），這裡只是即時顯示用的鏡像。
+  slotAlreadyPassed: function (slot) {
+    if (ub.state.form.date !== todayStr()) return false
+    var m = /~(\d{2}):(\d{2})/.exec(slot || '')
+    if (!m) return false
+    var endMin = parseInt(m[1], 10) * 60 + parseInt(m[2], 10)
+    var now = new Date()
+    var nowMin = now.getHours() * 60 + now.getMinutes()
+    return nowMin >= endMin
+  },
+
+  // 急件可選的時段：不能是已經過去的時段，而且要嘛本來就可預約，要嘛唯一被擋的原因剛好是
+  // 「已額滿」（急件可以突破名額）
+  slotSelectable: function (a, slot) {
+    return !!a && !ub.slotAlreadyPassed(slot) && (a.available || a.reason === '已額滿')
   },
 
   render: function () {
@@ -1082,6 +1102,7 @@ var ub = {
       '<ul class="space-y-1.5 text-sm text-amber-800 list-disc list-outside ml-4">' +
       '<li>此頁專供「已與採購員確認、需臨時插單」的緊急交貨使用，<strong>可略過名額限制與出單時間鎖定 (07:45/12:45)</strong>。</li>' +
       '<li>需先選擇對應採購員並輸入<strong>正確分機</strong>驗證通過後，才能繼續填寫其餘資料。</li>' +
+      '<li><strong>只能預約「今天」</strong>，日期欄位已鎖定；已經過去的時段（現在時間已超過該時段結束時間）也無法選擇。</li>' +
       '<li class="text-red-700 font-semibold">仍受週末公休、或管理員設定的暫停收貨規則（如盤點、廠休）限制，這些情況急件也無法預約。</li>' +
       '</ul></div></div></div>' +
 
@@ -1140,8 +1161,10 @@ var ub = {
       '<div class="grid grid-cols-1 md:grid-cols-2 gap-6 ' + (gateOk ? '' : 'opacity-50 pointer-events-none') + '">' +
       '<div><label class="block text-sm font-bold text-gray-700 mb-2">4. 預約日期 <span class="text-red-500">*</span></label>' +
       '<div class="relative"><i data-lucide="calendar" class="absolute left-3 top-3 h-5 w-5 text-gray-400"></i>' +
-      '<input type="date" ' + (gateOk ? 'required' : 'disabled') + ' lang="en" min="' + GLOBAL.config.minDate + '" max="' + GLOBAL.config.maxDate + '" data-onchange="date" value="' + f.date + '" ' +
-      'class="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-amber-500 focus:border-amber-500 outline-none transition bg-white" /></div>' +
+      // 急件只開放預約「今天」：日期欄位鎖死成今天（min=max=今天、disabled），不像一般預約可以選未來 30 天內任何一天
+      '<input type="date" disabled lang="en" min="' + todayStr() + '" max="' + todayStr() + '" value="' + f.date + '" ' +
+      'class="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-xl bg-gray-100 text-gray-600 cursor-not-allowed outline-none transition" /></div>' +
+      '<p class="mt-2 text-xs text-gray-400">急件僅開放預約當天，日期已鎖定為今天</p>' +
       '<div id="urgent-date-messages"></div></div>' +
 
       '<div><label class="block text-sm font-bold text-gray-700 mb-2">5. 預約時段 <span class="text-red-500">*</span></label>' +
@@ -1183,9 +1206,12 @@ var ub = {
       visibleSlots.map(function (slot) {
         var a = result.availability[slot]
         if (!a) return ''
-        var selectable = ub.slotSelectable(a)
+        var passed = ub.slotAlreadyPassed(slot)
+        var selectable = ub.slotSelectable(a, slot)
         var label = slot
-        if (!parcelSelected) {
+        if (passed) {
+          label += ' (已過時段)'
+        } else if (!parcelSelected) {
           if (a.available) label += ' (餘 ' + a.remaining + ')'
           else if (a.reason === '已額滿') label += ' (已額滿，急件可略過)'
         }
@@ -1320,10 +1346,12 @@ var ub = {
     s.error = ''
     var problems = []
     if (!s.purchaserVerified) problems.push('請先完成對應採購員的分機驗證')
+    if (f.date !== todayStr()) problems.push('急件僅開放預約當天') // 防呆用：日期欄位本身已鎖死成今天，理論上不會被改到別的日期
     if (f.locations.length === 0) problems.push('請選擇交貨地點')
     if (!f.time) problems.push('請選擇時段')
     var avail = ub.currentAvailability()
-    if (f.time && !ub.slotSelectable(avail.availability[f.time])) problems.push('所選時段暫停預約（急件也無法預約）')
+    if (f.time && ub.slotAlreadyPassed(f.time)) problems.push('所選時段已過，請重新選擇尚未結束的時段')
+    else if (f.time && !ub.slotSelectable(avail.availability[f.time], f.time)) problems.push('所選時段暫停預約（急件也無法預約）')
     if (!f.agreedToRules) problems.push('請勾選同意預約規定')
     if (problems.length > 0) { s.error = problems.join('；'); ub.render(); return }
 
